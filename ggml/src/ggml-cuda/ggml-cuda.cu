@@ -4987,6 +4987,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
@@ -5047,6 +5049,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on
                         return op->src[0]->ne[0] % QK_K == 0;
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                        return op->src[0]->ne[0] % QK_ROCMFP4 == 0;
                     default:
                         return false;
                 }
@@ -5061,7 +5066,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               op->type == GGML_TYPE_Q4_0_ROCMFP4 || op->type == GGML_TYPE_Q4_0_ROCMFP4_FAST) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -5102,6 +5108,36 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_F32) {
                     return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4_FAST && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return op->src[0]->ne[0] % QK_ROCMFP4 == 0;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4_FAST && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return op->src[0]->ne[0] % QK_ROCMFP4 == 0;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q5_0) {
                     return true;
