@@ -60,3 +60,12 @@
 - wmma dispatch 커버리지: 128토큰 청크당 2 op (K=320/N=10240, K=10240/N=320 hc 쌍)만이 eligible — 그럼에도 pp +49%.
 - MUL_MAT_ID(MoE expert)·FA·Q4_0_ROCMFP4_FAST는 기존 경로 — 후속 확장 대상.
 - decode 절대값(1.1-1.2ms/token)은 G-1A 기록(23 t/s)과 다름 — ON/OFF 동일하므로 wmma 무관, 별도 프로토콜 조사 필요.
+
+## debt 종결 후 재확정 (2026-09-04, no-UMA)
+- **측정 교정**: `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`이 decode를 35× 가짜가속+출력 훼손(§107). no-UMA 순수 VRAM이 정상 환경.
+- **back-to-back A/B (direct 모델, 교차 2×3)**: pp512 ON 281.3/282.6 vs OFF 280.8/281.8 → **현재 커버리지 end-to-end 이득 0**. tg128 23.25-23.56 양측 동일(정상 decode 복구 확인). 이전 +49%(UMA 하 bench)는 UMA가 MMQ 경로를 상대적으로 더 타락시킨 교란 효과로 판정 취소.
+- **커버리지 실탈**: dispatch는 생각보다 넓었다 (hc 쌍 + attn_gate 쌍 + shexp_up + 기타 9 shape, M=128). 문제는 커버리지가 아니라 **프리필 자체가 GEMM-bound가 아님**.
+- **rocprof 커널 집계 (227토큰 프롬프트, GPU busy 1.47s)**: elementwise 43.0% + quantize 16.0% = 59% 지배 / GEMM 전체(mmq 2.3 + mmvq 16.4 + wmma 1.2) = 19.9% / attention 0.4%. GEMM 커버 op(wmma)는 GPU 시간의 1.2%.
+- **shape 튜닝 (독립 검증)**: small-N 대형-K shape는 A 재판독 대역폭 포화(~260GB/s) → split-K(grid.z 단일 런치, ≤8 분할, 부분합+reduce)와 warp당 NT n-tile(A 재사용 NT배) 추가. K=6144/N=2560: 3.88→4.17 T-MAC/s, K=10240/N=320: 2.57→2.68. correctness 유지(서버 출력 토큰 동일). 다만 end-to-end 기여는 위 비율대로 ~0.
+- **확장 게이트 판정**: MUL_MAT_ID(MoE, M_e≈2.5로 타일 비효율)·ROCmFP4_FAST·기타 GEMM 확장은 **측정 근거로 게이트 실패 확정** — GEMM 전부를 2배로 가속해도 end-to-end +10%가 상한이고 현실 가속은 그보다 작음. FA는 attention 0.4%로 병목 아님 → 미개입 (사용자 규칙 준수).
+- **≥10% 프리필 개선의 실제 경로**: elementwise(hc add/mul/scale/sigmoid 체인)·quantize_q8_1 퓨전 — 기존 정상 경로 재설계를 수반하므로 별도 승인 필요.
