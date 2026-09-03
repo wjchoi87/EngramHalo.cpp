@@ -57,6 +57,11 @@ endif()
 
 message(STATUS "HIP and hipBLAS found")
 
+# G-1B: ROCmFP4 direct-fragment WMMA 경로 활성화 (gfx1151 전용, rocmfp4-wmma.cu)
+if (CMAKE_HIP_ARCHITECTURES MATCHES "gfx1151")
+    add_compile_definitions(GGML_ROCMFP4_WMMA_GFX1151=1)
+endif()
+
 file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 

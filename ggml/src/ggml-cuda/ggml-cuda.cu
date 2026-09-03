@@ -1835,6 +1835,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // G-1B: ROCmFP4 direct-fragment WMMA 경로 (gfx1151, prefill 크기 배치)
+    if (ggml_cuda_rocmfp4_wmma_eligible(src0, src1, dst)) {
+        ggml_cuda_mul_mat_rocmfp4_wmma(ctx, src0, src1, dst);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)

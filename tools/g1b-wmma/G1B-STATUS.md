@@ -36,3 +36,17 @@
 1. **full-model 통합** (standalone correctness 통과 후 허용): F32 src1 → f16 staging → wmma GEMM,
    M 충분히 큰(prefill) case에서 dp4a MMQ 대신 dispatch. MMVQ/decode는 기존 dp4a 유지.
 2. 통합 후 Flash-Next direct-quant A/B 재측정 (prefill 중심 개선 기대).
+
+## full-model 통합 (2026-09-04, build-g1a)
+- `ggml/src/ggml-cuda/rocmfp4-wmma.cu` 신설: F32 src1 → F16 staging → v4 커널(SEGS=2).
+  dispatch: `ggml_cuda_mul_mat`에서 eligible — src0=Q4_0_ROCMFP4, 2D, contiguous, K/N/M%32==0, M≥64,
+  `GGML_ROCMFP4_WMMA=0`로 런타임 비활성(동일 바이너리 A/B용), `GGML_ROCMFP4_WMMA_DEBUG=1`로 shape 덤프.
+  gfx1151 판정은 host pass에 device 매크로가 없으므로 CMake(`ggml-hip/CMakeLists.txt`)가
+  `CMAKE_HIP_ARCHITECTURES`에서 `GGML_ROCMFP4_WMMA_GFX1151`를 define.
+- standalone은 `[k/32][n]` 자체 레이아웃이었으나 ggml은 row-major `[n][k/32]` — 통합 시 2건의 버그:
+  1) W 블록 인덱스 전치 → illegal memory access (작은 N·큰 K에서 OOB)
+  2) dst store 전치(col_major 실수) → 버퍼 밖 write. GGML dst[n + m*N]에는 v4의 row-major store 그대로.
+  둘 다 `repro_server_shape.hip` (K=320/N=10240/M=128, K=10240/N=320/M=128)로 격리 재현 후 수정.
+- correctness: 서버 greedy 사실성 테스트(Paris/Berlin/Rome) G-1A baseline과 토큰까지 동일.
+  227토큰 raw 프롬프트 연속 생성은 ON/OFF 모두 degenerate 반복 — baseline 특성, wmma 무관.
+- K=10240 재현에서 maxabs=6.0은 |ref|~1.1e6 지점의 f32 누적 반올림(K·|W| ~3.4e8, 1-2 ulp)으로 benign.

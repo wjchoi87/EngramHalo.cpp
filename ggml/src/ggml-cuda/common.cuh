@@ -1760,3 +1760,7 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// G-1B: ROCmFP4 direct-fragment WMMA mul_mat 경로 (rocmfp4-wmma.cu, gfx1151)
+bool ggml_cuda_rocmfp4_wmma_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_rocmfp4_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
