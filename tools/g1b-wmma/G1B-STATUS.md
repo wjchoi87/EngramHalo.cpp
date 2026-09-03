@@ -50,3 +50,13 @@
 - correctness: 서버 greedy 사실성 테스트(Paris/Berlin/Rome) G-1A baseline과 토큰까지 동일.
   227토큰 raw 프롬프트 연속 생성은 ON/OFF 모두 degenerate 반복 — baseline 특성, wmma 무관.
 - K=10240 재현에서 maxabs=6.0은 |ref|~1.1e6 지점의 f32 누적 반올림(K·|W| ~3.4e8, 1-2 ulp)으로 benign.
+
+## full A/B — llama-bench 교차 반복 (2026-09-04, 동일 바이너리 env 토글, Flash-Next ROCmFP4 110.47GiB)
+조건: `-ngl 99 -p 512 -n 128 -ub 128 -r 3`, ON→OFF→ON→OFF 교차 (서멀 드리프트 상쇄), UMA env.
+| 지표 | WMMA OFF (dp4a MMQ) | WMMA ON | 개선 |
+|---|---|---|---|
+| pp512 (prefill) | 201.0 ± 5.3 / 208.7 ± 5.3 | **306.0 ± 26.7 / 305.2 ± 26.7** | **+49%** (라운드 양쪽 일관, 노이즈 밖 분리) |
+| tg128 (decode) | 917.5 ± 117.6 / 1123.3 ± 189.8 | 913.6 ± 123.6 / 1139.0 ± 202.5 | 변화 없음 (경로 미개재 확인용) |
+- wmma dispatch 커버리지: 128토큰 청크당 2 op (K=320/N=10240, K=10240/N=320 hc 쌍)만이 eligible — 그럼에도 pp +49%.
+- MUL_MAT_ID(MoE expert)·FA·Q4_0_ROCMFP4_FAST는 기존 경로 — 후속 확장 대상.
+- decode 절대값(1.1-1.2ms/token)은 G-1A 기록(23 t/s)과 다름 — ON/OFF 동일하므로 wmma 무관, 별도 프로토콜 조사 필요.
