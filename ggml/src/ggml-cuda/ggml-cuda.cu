@@ -2708,9 +2708,11 @@ static ggml_cuda_graph_verdict ggml_cuda_graph_update_required(ggml_backend_cuda
                     continue;
                 }
                 if (memcmp(x->ne, y->ne, sizeof(x->ne)) != 0 || memcmp(x->nb, y->nb, sizeof(x->nb)) != 0) {
-                    fprintf(stderr, "KEYDIFF[%d] op=%s name=%s SHAPE ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld]\n",
+                    fprintf(stderr, "KEYDIFF[%d] op=%s name=%s SHAPE stored_ne=[%lld,%lld,%lld,%lld] cur_ne=[%lld,%lld,%lld,%lld] stored_nb=[%lld,%lld,%lld,%lld] cur_nb=[%lld,%lld,%lld,%lld]\n",
                             i, ggml_op_name(y->op), y->name,
+                            (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3],
                             (long long)y->ne[0], (long long)y->ne[1], (long long)y->ne[2], (long long)y->ne[3],
+                            (long long)x->nb[0], (long long)x->nb[1], (long long)x->nb[2], (long long)x->nb[3],
                             (long long)y->nb[0], (long long)y->nb[1], (long long)y->nb[2], (long long)y->nb[3]);
                     ++shown;
                     continue;

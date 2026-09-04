@@ -3419,10 +3419,14 @@ ggml_tensor * llm_graph_context::build_rs(
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
-    // Clear a single state which will then be copied to the other cleared states.
-    // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    // [WonjinHALO] rs_z 셀 zeroing 뷰를 항상 full-size로 유지한다 (CUDA 그래프 토폴로지 안정화).
+    // 기존: rs_zero<0일 때 빈 뷰(ne=0) → 그래프 토폴로지가 청크마다 변해 replay가 깨졌다.
+    // 수정: 뷰는 항상 [state_size], rs_zero<0이면 row 0에 scale 1.0 (bit-exact no-op),
+    // rs_zero>=0이면 row rs_zero에 scale 0.0 (동일한 zeroing 의미). rs_z 값이 바뀌면 뷰
+    // 포인터가 바뀌어 그래프 키도 달라지므로 stale scale bake은 발생하지 않는다.
+    const bool has_z = rs_zero >= 0;
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size, (has_z ? rs_zero : 0)*states->nb[1]);
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, has_z ? 0.0f : 1.0f));
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
