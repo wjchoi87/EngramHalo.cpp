@@ -1275,6 +1275,22 @@ struct ggml_cuda_graph {
     };
     bool has_captured_props = false;   // capture 시점의 노드 props (순수 replay 판정용)
     std::vector<node_properties> captured_props;
+
+    // bake-schema auditor: capture 간 커널 인자 변동을 자동 분류한다.
+    //  - immutable: 두 capture에서 인자 바이트 동일
+    //  - safe-patch: 변동값이 tracked 텐서 포인터(captured→current)로 설명됨
+    //  - unknown: 설명 불가 변동 → 이 그래프는 replay 금지 (재캡처만)
+    struct kernel_snap {
+        hipGraphNode_t node = nullptr;
+        const void * func = nullptr;
+        dim3 grid = {}, block = {};
+        std::vector<uint8_t> arg_bytes;      // [arg][16B] flat
+        size_t n_args = 0;
+    };
+    std::vector<kernel_snap> kernel_snaps[2]; // [0]=S1(첫 capture), [1]=S2(재캡처)
+    bool has_kernel_snaps[2] = {false, false};
+    bool patch_verified = false;             // auditor 통과 → 선택 패치+replay 허용
+    bool no_replay = false;                  // unknown 존재 → 항상 재캡처
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {

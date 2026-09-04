@@ -2683,6 +2683,84 @@ static bool ggml_cuda_node_topology_equal(const ggml_cuda_graph::node_properties
     return true;
 }
 
+// === bake-schema auditor ===
+// 커널 노드의 인자 값을 스냅샷한다 (arg당 16B, nullptr까지 최대 32개).
+static bool ggml_cuda_graph_snap_kernels(ggml_cuda_graph * graph, std::vector<ggml_cuda_graph::kernel_snap> & out) {
+    out.clear();
+    // 이 플랫폼에서 hipGraphKernelNodeGetParams의 kernelParams가 capture 이후 dangling을
+    // 반환하는 사례(세그폴트)가 있어 기본 비활성화 — GGML_CUDA_GRAPH_AUDIT=1로 실험 가능.
+    static const bool audit_enabled = [] {
+        const char * t = getenv("GGML_CUDA_GRAPH_AUDIT");
+        return t && t[0] && !(t[0] == '0' && t[1] == '\0');
+    }();
+    if (!audit_enabled) return false;
+    // 주의: AUDIT=1은 이 플랫폼(HIP 7.2 + 커스텀 커널 7.0.0-30)에서 capture 후 GetParams의
+    // kernelParams storage가 dangling을 반환해 segfault를 재현한다 (§118).
+    size_t n = 0;
+    if (hipGraphGetNodes(graph->graph, nullptr, &n) != hipSuccess || n == 0) return false;
+    std::vector<hipGraphNode_t> nodes(n);
+    if (hipGraphGetNodes(graph->graph, nodes.data(), &n) != hipSuccess) return false;
+    for (auto nd : nodes) {
+        hipKernelNodeParams p = {};
+        if (hipGraphKernelNodeGetParams(nd, &p) != hipSuccess) continue; // 커널 외 노드 스킵
+        ggml_cuda_graph::kernel_snap ks;
+        ks.node = nd;
+        ks.func = p.func;
+        ks.grid = p.gridDim;
+        ks.block = p.blockDim;
+        if (p.kernelParams != nullptr) {
+            for (int a = 0; a < 32 && p.kernelParams[a] != nullptr; ++a) {
+                const uint8_t * src = (const uint8_t *) p.kernelParams[a];
+                ks.arg_bytes.insert(ks.arg_bytes.end(), src, src + 16);
+                ks.n_args++;
+            }
+        }
+        out.push_back(std::move(ks));
+    }
+    return !out.empty();
+}
+
+// S1 vs S2 diff → 분류. tracked 맵: 이전 포인터 값 → 새 포인터 값 (captured_props ↔ node_props).
+// 반환: unknown 개수 (0이면 전 변동이 tracked 포인터로 설명됨 = patch-safe).
+static int ggml_cuda_graph_audit_diff(
+        const std::vector<ggml_cuda_graph::kernel_snap> & s1,
+        const std::vector<ggml_cuda_graph::kernel_snap> & s2,
+        const std::vector<std::pair<void *, void *>> & remap,
+        const char * graph_tag) {
+    if (s1.size() != s2.size()) return (int) s1.size() + (int) s2.size();
+    auto lookup = [&remap](void * v) -> void * {
+        for (auto & r : remap) {
+            if (r.first == v) return r.second;
+        }
+        return nullptr;
+    };
+    int unknown = 0;
+    for (size_t k = 0; k < s1.size(); ++k) {
+        const auto & a = s1[k];
+        const auto & b = s2[k];
+        if (a.func != b.func || a.grid.x != b.grid.x || a.grid.y != b.grid.y || a.grid.z != b.grid.z ||
+            a.block.x != b.block.x || a.block.y != b.block.y || a.block.z != b.block.z) {
+            fprintf(stderr, "AUDIT[%s] kernel#%zu func/grid 변화 — unknown\n", graph_tag, k);
+            ++unknown;
+            continue;
+        }
+        const size_t nb = std::min(a.arg_bytes.size(), b.arg_bytes.size());
+        for (size_t off = 0; off < nb; off += 16) {
+            if (memcmp(a.arg_bytes.data() + off, b.arg_bytes.data() + off, 16) == 0) continue;
+            void * old_v = nullptr, * new_v = nullptr;
+            memcpy(&old_v, a.arg_bytes.data() + off, sizeof(void *));
+            memcpy(&new_v, b.arg_bytes.data() + off, sizeof(void *));
+            void * mapped = lookup(old_v);
+            if (mapped != nullptr && mapped == new_v) continue;      // tracked 포인터 이동 = safe-patch
+            if (old_v == new_v) continue;                            // 동일
+            fprintf(stderr, "AUDIT[%s] kernel#%zu arg@+%zu bytes 변화가 tracked 포인터로 설명 안 됨 — unknown\n",
+                    graph_tag, k, off);
+            ++unknown;
+        }
+    }
+    return unknown;
+}
+
 static ggml_cuda_graph_verdict ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
     bool topo_res = false;
@@ -4380,6 +4458,44 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
             }
+            // bake-schema auditor: capture 간 커널 인자 diff로 변동 클래스를 검증한다.
+            // tracked 포인터로 설명되는 변동만 있으면 patch_verified=true (선택 패치+replay 허용),
+            // unknown이 하나라도 있으면 no_replay=true (이 그래프는 항상 재캡처).
+            {
+                std::vector<std::pair<void *, void *>> remap;
+                if (graph->has_captured_props && graph->captured_props.size() == graph->node_props.size()) {
+                    for (size_t i = 0; i < graph->node_props.size(); ++i) {
+                        if (graph->captured_props[i].node.data != graph->node_props[i].node.data) {
+                            remap.push_back({graph->captured_props[i].node.data, graph->node_props[i].node.data});
+                        }
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            if (graph->captured_props[i].node_src_data_ptrs[j] != graph->node_props[i].node_src_data_ptrs[j]) {
+                                remap.push_back({graph->captured_props[i].node_src_data_ptrs[j], graph->node_props[i].node_src_data_ptrs[j]});
+                            }
+                        }
+                    }
+                }
+                std::vector<ggml_cuda_graph::kernel_snap> snap;
+                if (ggml_cuda_graph_snap_kernels(graph, snap)) {
+                    if (!graph->has_kernel_snaps[0]) {
+                        graph->kernel_snaps[0] = std::move(snap);
+                        graph->has_kernel_snaps[0] = true;
+                    } else if (!graph->patch_verified && !graph->no_replay) {
+                        const int unknown = ggml_cuda_graph_audit_diff(graph->kernel_snaps[0], snap, remap, "graph");
+                        if (unknown == 0) {
+                            graph->patch_verified = true;
+                            GGML_LOG_DEBUG("%s: bake-schema audit passed — safe patch replay enabled\n", __func__);
+                        } else {
+                            graph->no_replay = true;
+                            graph->kernel_snaps[0] = std::move(snap);
+                            GGML_LOG_DEBUG("%s: bake-schema audit found %d unknown — replay disabled\n", __func__, unknown);
+                        }
+                    } else {
+                        graph->kernel_snaps[1] = std::move(snap);
+                        graph->has_kernel_snaps[1] = true;
+                    }
+                }
+            }
             // capture 시점의 props를 저장 — 다음 호출이 동일 포인터면 순수 replay로 스킵
             graph->captured_props = graph->node_props;
             graph->has_captured_props = true;
@@ -4522,8 +4638,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 } else {
                     use_cuda_graph = true;
                     // capture 시점과 포인터가 동일하면 순수 replay.
-                    // 다르면 선택 포인터 패치로 exec를 최신 버퍼로 갱신하고 replay,
-                    // 패치 불가(신규 버퍼/토폴로지 변화)일 때만 재캡처한다.
+                    // 다르면 auditor 검증된 범위 내에서 선택 포인터 패치 후 replay,
+                    // 미검증/실패 시 재캡처한다 (stale replay 금지).
                     bool same_as_captured = graph->has_captured_props &&
                         graph->captured_props.size() == graph->node_props.size();
                     for (size_t i = 0; same_as_captured && i < graph->node_props.size(); ++i) {
@@ -4531,19 +4647,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                     if (same_as_captured || graph->instance == nullptr) {
                         cuda_graph_update_required = graph->instance == nullptr;
+                    } else if (graph->patch_verified && ggml_cuda_graph_patch_pointers(graph, graph->node_props)) {
+                        cuda_graph_update_required = false;
                     } else {
-                        // 선택 패치는 opt-in (GGML_CUDA_GRAPH_PTRPATCH=1): 커널이 bake하는
-                        // 포인터 클래스 전체를 props가 커버하지 않으면 stale write가 발생할 수
-                        // 있어 기본은 재캡처(안전)로 폴백한다.
-                        static const bool ptrpatch_enabled = [] {
-                            const char * t = getenv("GGML_CUDA_GRAPH_PTRPATCH");
-                            return t && t[0] && !(t[0] == '0' && t[1] == '\0');
-                        }();
-                        if (ptrpatch_enabled && ggml_cuda_graph_patch_pointers(graph, graph->node_props)) {
-                            cuda_graph_update_required = false;
-                        } else {
-                            cuda_graph_update_required = true;
-                        }
+                        cuda_graph_update_required = true;
                     }
                 }
             }
