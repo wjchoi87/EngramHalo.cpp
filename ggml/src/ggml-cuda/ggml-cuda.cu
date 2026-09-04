@@ -27,6 +27,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/hc-fuse.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -2772,6 +2773,27 @@ static ggml_cuda_graph_verdict ggml_cuda_graph_update_required(ggml_backend_cuda
     if (graph_dbg) {
         fprintf(stderr, "%s: uid cgraph=%zu stored=%zu n_nodes=%d\n", __func__, cgraph->uid, graph->uid, cgraph->n_nodes);
     }
+    {
+        static const bool op_hist = getenv("GGML_CUDA_GRAPH_OPHIST") != nullptr;
+        if (op_hist && cgraph->n_nodes > 100) {
+            static long hist_seq = 0;
+            if (hist_seq++ % 8 == 0) {
+                std::map<std::string, int> h;
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    h[ggml_op_name(cgraph->nodes[i]->op)]++;
+                }
+                std::string out;
+                char buf[64];
+                snprintf(buf, sizeof(buf), "OPHIST n=%d:", cgraph->n_nodes);
+                out += buf;
+                for (auto & kv : h) {
+                    snprintf(buf, sizeof(buf), " %s=%d", kv.first.c_str(), kv.second);
+                    out += buf;
+                }
+                fprintf(stderr, "%s\n", out.c_str());
+            }
+        }
+    }
     // 디버그: 동일 노드 수의 이전 그래프 대비 최초로 달라진 bake 포인터 지목 (새 키 원인 규명용)
     static std::vector<ggml_cuda_graph::node_properties> dbg_prev;
     if (graph_dbg && cgraph->n_nodes > 100) {
@@ -4257,6 +4279,176 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // === HC chain fusion (qwen4exp hyper-connection, GGML_CUDA_HCFUSION=1) ===
+    // 그룹 비트: C1 collapse=1, C4 comb_w=2, C6 sigm_mul=4, C2 silu_scale=8, C5 comb_fma=16
+    // (GGML_CUDA_HCFUSION_GROUPS hex, 기본 전체)
+    if (hc_fuse_enabled()) {
+        static const int hc_groups = [] {
+            const char * t = getenv("GGML_CUDA_HCFUSION_GROUPS");
+            return t && t[0] ? (int) strtol(t, nullptr, 16) : 0x1F;
+        }();
+        // (C1) stream collapse: VIEW,CONT,VIEW,ADD,VIEW,ADD,VIEW,ADD,SCALE (9→1)
+        if ((hc_groups & 0x1) && node->op == GGML_OP_VIEW && i + 8 < (int) cgraph->n_nodes) {
+            const ggml_tensor * v0 = node;
+            const ggml_tensor * cont  = cgraph->nodes[i + 1];
+            const ggml_tensor * v1    = cgraph->nodes[i + 2];
+            const ggml_tensor * add1  = cgraph->nodes[i + 3];
+            const ggml_tensor * v2    = cgraph->nodes[i + 4];
+            const ggml_tensor * add2  = cgraph->nodes[i + 5];
+            const ggml_tensor * v3    = cgraph->nodes[i + 6];
+            const ggml_tensor * add3  = cgraph->nodes[i + 7];
+            const ggml_tensor * sc    = cgraph->nodes[i + 8];
+
+            // 뷰 4개는 스트라이드 뷰(nb1 = hc 행 스트라이드)라 cont/mixed(연속 [E,T])와
+            // layout이 달라도 무방 — 퓨전 커널은 gated base를 스트림 스트라이드로 직접 읽고
+            // 연속 [E,T]로 쓴다. 검증은 뷰 간 일관성 + 출력 연속성만 수행.
+            const bool shape_ok = v0->type == GGML_TYPE_F32 && v1->type == GGML_TYPE_F32 &&
+                                  v2->type == GGML_TYPE_F32 && v3->type == GGML_TYPE_F32 &&
+                                  cont->type == GGML_TYPE_F32 && sc->type == GGML_TYPE_F32 &&
+                                  ggml_are_same_layout(v0, v1) && ggml_are_same_layout(v0, v2) &&
+                                  ggml_are_same_layout(v0, v3) &&
+                                  ggml_is_contiguous(cont) && ggml_is_contiguous(sc) &&
+                                  ggml_is_contiguous(sc->src[0]);
+            if (shape_ok &&
+                cont->op == GGML_OP_CONT && cont->src[0] == v0 &&
+                add1->op == GGML_OP_ADD && add1->src[0] == cont && add1->src[1] == v1 &&
+                add2->op == GGML_OP_ADD && add2->src[0] == add1 && add2->src[1] == v2 &&
+                add3->op == GGML_OP_ADD && add3->src[0] == add2 && add3->src[1] == v3 &&
+                sc->op == GGML_OP_SCALE && sc->src[0] == add3 &&
+                v0->src[0] == v1->src[0] && v1->src[0] == v2->src[0] && v2->src[0] == v3->src[0] &&
+                v1->nb[0] == v2->nb[0] && v2->nb[0] == v3->nb[0]) {
+                // 4개 뷰의 오프셋이 스트림 인덱스 × 스트림 stride로 균등한지 확인
+                const size_t sstride = v1->nb[0] * v0->ne[0];   // 스트림 1개 바이트
+                const int64_t off0 = v0->view_offs;
+                const int64_t off1 = v1->view_offs;
+                const int64_t off2 = v2->view_offs;
+                const int64_t off3 = v3->view_offs;
+                static const bool c1dbg = getenv("GGML_CUDA_HCFUSION_DEBUG") != nullptr;
+                if (c1dbg && (off1 - off0 != (int64_t) sstride || off2 - off1 != (int64_t) sstride ||
+                              off3 - off2 != (int64_t) sstride)) {
+                    fprintf(stderr, "C1 MISS strides %lld %lld %lld %lld (sstride=%lld)\n",
+                            (long long) off0, (long long) off1, (long long) off2, (long long) off3, (long long) sstride);
+                }
+                if (off1 - off0 == (int64_t) sstride && off2 - off1 == (int64_t) sstride &&
+                        off3 - off2 == (int64_t) sstride) {
+                    const int E = (int) v0->ne[0];
+                    const int C = (int)(off1 - off0) / (int)(v0->nb[0] * v0->ne[0]);
+                    const int T = (int) v0->ne[1];
+                    float s = 1.0f;
+                    memcpy(&s, sc->op_params, sizeof(float));
+                    hc_collapse_f32<<<(E*T + 255)/256, 256, 0, cuda_ctx->stream()>>>(
+                            (const float *) v0->src[0]->data, (float *) sc->data, E, C, E*T, s);
+                    return 8;
+                }
+            }
+        }
+
+        // (C4) combine w: SCALE,UNARY(SIGMOID),SCALE (3→1) — w = 2·sigmoid(x·s1)
+        if ((hc_groups & 0x2) && node->op == GGML_OP_SCALE && i + 2 < (int) cgraph->n_nodes) {
+            const ggml_tensor * s1n = node;
+            const ggml_tensor * sig = cgraph->nodes[i + 1];
+            const ggml_tensor * s2n = cgraph->nodes[i + 2];
+            static const bool c4dbg = getenv("GGML_CUDA_HCFUSION_DEBUG") != nullptr;
+            const bool ok = s1n->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 && s2n->type == GGML_TYPE_F32 &&
+                    sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
+                    sig->src[0] == s1n && s2n->op == GGML_OP_SCALE && s2n->src[0] == sig &&
+                    ggml_are_same_layout(s1n, sig) && ggml_are_same_layout(sig, s2n) &&
+                    ggml_is_contiguous(s1n) && s1n->ne[0] == 1;
+            if (c4dbg && !ok && s1n->ne[0] == 1 && sig->op == GGML_OP_UNARY) {
+                fprintf(stderr, "C4 MISS ne0=%d lay=%d cont=%d src0ok=%d s2ok=%d s2src=%p sig=%p s2_op=%s s2_ne=[%lld,%lld]\n",
+                        (int) s1n->ne[0], (int) ggml_are_same_layout(s1n, sig),
+                        (int) ggml_is_contiguous(s1n), (int)(sig->src[0] == s1n), (int)(s2n->src[0] == sig),
+                        (void *) s2n->src[0], (void *) sig, ggml_op_name(s2n->src[0] ? s2n->src[0]->op : GGML_OP_NONE),
+                        (long long)(s2n->src[0] ? s2n->src[0]->ne[0] : -1), (long long)(s2n->src[0] ? s2n->src[0]->ne[1] : -1));
+            }
+            if (ok) {
+                float f1 = 1.0f, f2 = 1.0f;
+                memcpy(&f1, s1n->op_params, sizeof(float));
+                memcpy(&f2, s2n->op_params, sizeof(float));
+                const int64_t n = s1n->ne[0] * s1n->ne[1] * s1n->ne[2];
+                hc_comb_w_f32<<<(n + 255)/256, 256, 0, cuda_ctx->stream()>>>(
+                        (const float *) s1n->data, (float *) s2n->data, n, f1, f2);
+                return 2;
+            }
+        }
+
+        // (C6) gated: UNARY(SIGMOID),MUL (2→1) — gated = xn · sigmoid(mm)
+        if ((hc_groups & 0x4) && node->op == GGML_OP_UNARY && i + 1 < (int) cgraph->n_nodes) {
+            const ggml_tensor * sig = node;
+            const ggml_tensor * mul = cgraph->nodes[i + 1];
+            static const bool c6dbg = getenv("GGML_CUDA_HCFUSION_DEBUG") != nullptr;
+            if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
+                    mul->op == GGML_OP_MUL && mul->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 &&
+                    ggml_are_same_layout(sig, mul) && ggml_is_contiguous(sig) && ggml_is_contiguous(mul)) {
+                const ggml_tensor * xn = (mul->src[0] == sig) ? mul->src[1] : mul->src[0];
+                if (xn->type == GGML_TYPE_F32 && ggml_are_same_layout(xn, sig) && ggml_is_contiguous(xn)) {
+                    if (c6dbg) fprintf(stderr, "C6 FIRE %s\n", sig->name);
+                    hc_sigm_mul_f32<<<(ggml_nelements(sig) + 255)/256, 256, 0, cuda_ctx->stream()>>>(
+                            (const float *) xn->data, (const float *) sig->data, (float *) mul->data,
+                            ggml_nelements(sig));
+                    return 1;
+                }
+                if (c6dbg) fprintf(stderr, "C6 MISS xn-layout %s n=%p\n", sig->name, (void *) xn);
+            } else if (c6dbg && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID) {
+                fprintf(stderr, "C6 SKIP next=%s sigtype=%d\n", ggml_op_name(mul->op), (int) sig->type);
+            }
+        }
+
+        // (C2) silu-scale: SCALE,UNARY(SILU) (2→1) — silu(x·s)
+        if ((hc_groups & 0x8) && node->op == GGML_OP_SCALE && i + 1 < (int) cgraph->n_nodes) {
+            const ggml_tensor * sc = node;
+            const ggml_tensor * sil = cgraph->nodes[i + 1];
+            if (sil->op == GGML_OP_UNARY && ggml_get_unary_op(sil) == GGML_UNARY_OP_SILU &&
+                    sil->src[0] == sc && sc->type == GGML_TYPE_F32 && sil->type == GGML_TYPE_F32 &&
+                    ggml_are_same_layout(sc, sil) && ggml_is_contiguous(sc)) {
+                float f = 1.0f;
+                memcpy(&f, sc->op_params, sizeof(float));
+                const int64_t n = sc->ne[0] * sc->ne[1] * sc->ne[2];
+                hc_silu_scale_f32<<<(n + 255)/256, 256, 0, cuda_ctx->stream()>>>(
+                        (const float *) sc->data, (float *) sil->data, n, f);
+                return 1;
+            }
+        }
+
+        // (C5) combine fma: RESHAPE,REPEAT,MUL,ADD (4→1) — cur = res + bbroadcast·w
+        if ((hc_groups & 0x10) && node->op == GGML_OP_RESHAPE && i + 3 < (int) cgraph->n_nodes) {
+            const ggml_tensor * resh = node;
+            const ggml_tensor * rep  = cgraph->nodes[i + 1];
+            const ggml_tensor * muln = cgraph->nodes[i + 2];
+            const ggml_tensor * addn = cgraph->nodes[i + 3];
+            const bool ok = resh->type == GGML_TYPE_F32 && rep->op == GGML_OP_REPEAT &&
+                    muln->op == GGML_OP_MUL && addn->op == GGML_OP_ADD &&
+                    rep->src[0] == resh && muln->src[0] == rep && muln->src[1] != nullptr &&
+                    (addn->src[0] == muln || addn->src[1] == muln) &&
+                    rep->type == GGML_TYPE_F32 && muln->type == GGML_TYPE_F32 && addn->type == GGML_TYPE_F32;
+            if (ok) {
+                const ggml_tensor * res = (addn->src[0] == muln) ? addn->src[1] : addn->src[0];
+                const ggml_tensor * b   = resh->src[0];
+                const ggml_tensor * w   = (muln->src[0] == rep) ? muln->src[1] : muln->src[0];
+                const bool shapes_ok = ggml_is_contiguous(rep->src[0]) && ggml_is_contiguous(w) &&
+                        ggml_is_contiguous(res) && ggml_is_contiguous(addn) &&
+                        rep->src[0]->ne[1] == 1 && w->ne[0] == 1 &&
+                        rep->src[0]->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+                        res->type == GGML_TYPE_F32 && addn->type == GGML_TYPE_F32 &&
+                        addn->ne[0] == w->ne[0] * rep->src[0]->ne[0] &&
+                        addn->ne[1] == w->ne[1] * rep->src[0]->ne[1] &&
+                        addn->ne[2] == rep->src[0]->ne[2] &&
+                        b->ne[0] == res->ne[0] && b->ne[1] == res->ne[2] &&
+                        w->ne[1] == rep->src[0]->ne[1] &&
+                        ggml_are_same_layout(res, addn) && ggml_are_same_layout(muln, addn);
+                if (shapes_ok) {
+                    const int E = (int) b->ne[0];
+                    const int C = (int) rep->ne[1];
+                    const int64_t T = b->ne[1];
+                    hc_comb_fma_f32<<<((int64_t)E*C*T + 255)/256, 256, 0, cuda_ctx->stream()>>>(
+                            (const float *) res->data, (const float *) b->data, (const float *) w->data,
+                            (float *) addn->data, E, C, (int64_t)E*C*T);
+                    return 3;
+                }
+            }
+        }
     }
 
     return 0;
