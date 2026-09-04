@@ -1,4 +1,6 @@
 #include "llama-kv-cache.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -1268,6 +1270,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
+
+    if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
+        fprintf(stderr, "GETK il=%d n_kv=%u data=%p used=%u\n", il, n_kv, (void *) k->data, (unsigned) v_cells[sinfo.strm[0]].used_max_p1());
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
