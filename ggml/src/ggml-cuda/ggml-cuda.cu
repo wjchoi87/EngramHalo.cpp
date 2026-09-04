@@ -2599,20 +2599,106 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // GGML_CUDA_GRAPH_TOPO=1: 토폴로지 안정 키(아래). 기본은 원래 nodes[0] 포인터 키(수정 전 동작).
+    static const bool topo_key = [] {
+        const char * t = getenv("GGML_CUDA_GRAPH_TOPO");
+        return t && t[0] && !(t[0] == '0' && t[1] == '\0');
+    }();
+    if (!topo_key) {
+        return cgraph->nodes[0];
+    }
+    // nodes[0] 포인터는 sched ctx 재작성마다 이동할 수 있다(복수 shape-class 그래프가 하나의
+    // sched ctx를 공유하는 아키텍처 — 예: 1-node input-embed 그래프와 본 그래프의 교차 rebuild).
+    // 토폴로지(op/type/ne 시퀀스)로 안정 키를 계산한다. 충돌 시 node_props 비교가 틀리면
+    // 기존 경로대로 eager 실행되므로 정확성에는 무영향(성능만 손해).
+    // bake되는 포인터(node->data, src data)도 키에 포함한다: 활성 버퍼가 주기적으로
+    // 교대하는 경우(pool free-list) 주소 집합별로 별도 그래프가 capture되어 전부 replay된다.
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix((uint64_t)(uint32_t) n->op);
+        mix((uint64_t)(uint32_t) n->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t) n->ne[d]);
+            mix((uint64_t) n->nb[d]);
+        }
+        mix((uint64_t)(uintptr_t) n->data);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (n->src[j]) {
+                mix((uint64_t)(uintptr_t) n->src[j]->data);
+            }
+        }
+    }
+    return (const void *)(uintptr_t) h;
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+// capture-safe semantic 비교: 커널 파라미터로 bake되는 값(포인터/shape/op)만 검사.
+// ggml_tensor 구조체 자체의 신원 필드(src 텐서 포인터, view_src, buffer, extra, name, padding)는
+// sched ctx 재작성마다 이동하며 커널 semantics와 무관 → 비교에서 제외. 주소가 드리프트 중이면
+// mismatch로 eager fallback(안전), 안정화되면 capture 재사용.
+static bool ggml_cuda_node_props_equal(const ggml_cuda_graph::node_properties & a, const ggml_cuda_graph::node_properties & b) {
+    static const bool topo_key = [] {
+        const char * t = getenv("GGML_CUDA_GRAPH_TOPO");
+        return t && t[0] && !(t[0] == '0' && t[1] == '\0');
+    }();
+    if (!topo_key) {
+        return memcmp(&a, &b, sizeof(a)) == 0;
+    }
+    const ggml_tensor * x = &a.node;
+    const ggml_tensor * y = &b.node;
+    if (x->op != y->op || x->type != y->type || x->flags != y->flags) return false;
+    if (x->data != y->data) return false;
+    // op_params 포인터는 그래프 ctx 재작성마다 이동한다(허상 포인터 비교가 됨). 내용은
+    // 토폴로지가 결정하고 capture/replay가 같은 arena 주소를 가리키므로 비교에서 제외한다 —
+    // decode 그래프 재사용 경로와 동일한 전제.
+    if (memcmp(x->ne, y->ne, sizeof(x->ne)) != 0) return false;
+    if (memcmp(x->nb, y->nb, sizeof(x->nb)) != 0) return false;
+    if (memcmp(a.node_src_data_ptrs, b.node_src_data_ptrs, sizeof(a.node_src_data_ptrs)) != 0) return false;
+    if (memcmp(a.node_src_ne, b.node_src_ne, sizeof(a.node_src_ne)) != 0) return false;
+    if (memcmp(a.node_src_nb, b.node_src_nb, sizeof(a.node_src_nb)) != 0) return false;
+    return true;
+}
+
+struct ggml_cuda_graph_verdict {
+    bool topology_changed;  // op/type/shape 토폴로지 변경 — warmup 리셋 필요
+    bool props_changed;     // bake되는 포인터(data/src-data/op_params) 변경 — 재캡처 필요
+};
+
+static bool ggml_cuda_node_topology_equal(const ggml_cuda_graph::node_properties & a, const ggml_cuda_graph::node_properties & b) {
+    const ggml_tensor * x = &a.node;
+    const ggml_tensor * y = &b.node;
+    if (x->op != y->op || x->type != y->type || x->flags != y->flags) return false;
+    if (memcmp(x->ne, y->ne, sizeof(x->ne)) != 0) return false;
+    if (memcmp(x->nb, y->nb, sizeof(x->nb)) != 0) return false;
+    // src 존재 여부 + src shape (포인터/데이터는 제외)
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const bool has_a = a.node_src_data_ptrs[j] != nullptr || a.node_src_ne[j][0] != 0;
+        const bool has_b = b.node_src_data_ptrs[j] != nullptr || b.node_src_ne[j][0] != 0;
+        if (has_a != has_b) return false;
+        if (has_a && (memcmp(a.node_src_ne[j], b.node_src_ne[j], sizeof(a.node_src_ne[j])) != 0 ||
+                      memcmp(a.node_src_nb[j], b.node_src_nb[j], sizeof(a.node_src_nb[j])) != 0)) return false;
+    }
+    return true;
+}
+
+static ggml_cuda_graph_verdict ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
+    bool topo_res = false;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    static const bool graph_dbg = getenv("GGML_CUDA_GRAPH_DEBUG");
+    if (graph_dbg) {
+        fprintf(stderr, "%s: uid cgraph=%zu stored=%zu n_nodes=%d\n", __func__, cgraph->uid, graph->uid, cgraph->n_nodes);
+    }
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-        return false;
+        return {false, false};
     }
 
     graph->uid = cgraph->uid;
@@ -2635,13 +2721,26 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        const bool node_topo_diff = !ggml_cuda_node_topology_equal(graph->node_props[i], prop);
+        if (node_topo_diff) topo_res = true;
+        if (res || node_topo_diff || !ggml_cuda_node_props_equal(graph->node_props[i], prop)) {
+            if (graph_dbg && !res) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                bool data_diff = graph->node_props[i].node.data != prop.node.data;
+                bool params_diff = graph->node_props[i].node.op_params != prop.node.op_params;
+                bool srcptr_diff = false;
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (graph->node_props[i].node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) srcptr_diff = true;
+                }
+                fprintf(stderr, "%s: prop change node[%d] op=%s name=%s data_diff=%d params_diff=%d srcptr_diff=%d\n",
+                        __func__, i, ggml_op_name(node->op), node->name, (int)data_diff, (int)params_diff, (int)srcptr_diff);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
     }
 
-    return res;
+    return {topo_res, res};
 }
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
@@ -4238,6 +4337,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
             }
+            // capture 시점의 props를 저장 — 다음 호출이 동일 포인터면 순수 replay로 스킵
+            graph->captured_props = graph->node_props;
+            graph->has_captured_props = true;
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -4295,32 +4397,45 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const ggml_cuda_graph_verdict verdict = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = verdict.props_changed;
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                // Warmup: 토폴로지가 동일한 호출이 2회 연속이면 capture로 진입한다.
+                // bake 포인터(data/src-data/op_params)는 호출마다 바뀔 수 있으나 capture가
+                // 현재 포인터로 기록하므로 정확성에 영향 없음.
+                if (!verdict.topology_changed) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+                // else: topology changed or first call - execute directly (use_cuda_graph stays false)
             } else {
-                // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
+                // Post-warmup: 토폴로지 동일 — 포인터가 같으면 순수 replay, 다르면 재캡처.
+                if (verdict.topology_changed) {
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                    // capture 시점과 포인터가 동일하면 순수 replay (재캡처 생략)
+                    bool same_as_captured = graph->has_captured_props &&
+                        graph->captured_props.size() == graph->node_props.size();
+                    for (size_t i = 0; same_as_captured && i < graph->node_props.size(); ++i) {
+                        same_as_captured = ggml_cuda_node_props_equal(graph->captured_props[i], graph->node_props[i]);
+                    }
+                    cuda_graph_update_required = !same_as_captured || graph->instance == nullptr;
                 }
             }
         }
     }
 #endif // USE_CUDA_GRAPH
 
+    if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
+        fprintf(stderr, "GRAPHPATH: use_graph=%d update_req=%d warmup=%d key=%p n_nodes=%d\n",
+                (int) use_cuda_graph, (int) cuda_graph_update_required,
+                0, graph_key, (int) cgraph->n_nodes);
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {

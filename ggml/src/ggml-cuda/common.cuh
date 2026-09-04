@@ -1273,6 +1273,8 @@ struct ggml_cuda_graph {
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
+    bool has_captured_props = false;   // capture 시점의 노드 props (순수 replay 판정용)
+    std::vector<node_properties> captured_props;
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
