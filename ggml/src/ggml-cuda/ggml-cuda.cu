@@ -4529,10 +4529,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                     if (same_as_captured || graph->instance == nullptr) {
                         cuda_graph_update_required = graph->instance == nullptr;
-                    } else if (ggml_cuda_graph_patch_pointers(graph, graph->node_props)) {
-                        cuda_graph_update_required = false;
                     } else {
-                        cuda_graph_update_required = true;
+                        // 선택 패치는 opt-in (GGML_CUDA_GRAPH_PTRPATCH=1): 커널이 bake하는
+                        // 포인터 클래스 전체를 props가 커버하지 않으면 stale write가 발생할 수
+                        // 있어 기본은 재캡처(안전)로 폴백한다.
+                        static const bool ptrpatch_enabled = [] {
+                            const char * t = getenv("GGML_CUDA_GRAPH_PTRPATCH");
+                            return t && t[0] && !(t[0] == '0' && t[1] == '\0');
+                        }();
+                        if (ptrpatch_enabled && ggml_cuda_graph_patch_pointers(graph, graph->node_props)) {
+                            cuda_graph_update_required = false;
+                        } else {
+                            cuda_graph_update_required = true;
+                        }
                     }
                 }
             }

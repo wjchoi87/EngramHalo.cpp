@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2232,6 +2233,18 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// 실험 파라미터: KV 그래프 버킷 크기 (n_pad). base cache가 max(n_pad, 256)로 n_kv를 버킷하므로
+// 256 이상에서 유효하다. 크게 할수록 그래프 재캡처가 줄어들고(그래프 replay 증가) 버킷 경계의
+// 패딩 어텐션 계산이 늘어난다. 기본 1 = 기존 동작(버킷 256).
+static uint32_t llama_kv_n_pad_env() {
+    const char * s = getenv("LLAMA_KV_NPAD");
+    if (!s || !s[0]) {
+        return 1;
+    }
+    const long v = strtol(s, nullptr, 10);
+    return v > 0 ? (uint32_t) v : 1u;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2375,7 +2388,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
                             cparams.n_ubatch,
-                            1,
+                            /* n_pad (KV graph bucket) */ llama_kv_n_pad_env(),
                             filter_mla,
                             filter_lid,
                             nullptr);
