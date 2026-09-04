@@ -4420,6 +4420,66 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// 선택 포인터 패치: capture 시점 대비 bake 포인터(data/src-data)가 이동한 경우,
+// exec의 커널 노드 파라미터에서 이전 포인터 값을 새 포인터로 재매핑한다 (재캡처 불필요).
+// 새 데이터는 이번 호출의 실제 버퍼에 있으므로 stale replay가 아니라 정확한 최신 데이터를 읽는다.
+// 토폴로지가 다르면 안전하게 실패(false) → 호출부가 재캡처로 폴백.
+static bool ggml_cuda_graph_patch_pointers(ggml_cuda_graph * graph, const std::vector<ggml_cuda_graph::node_properties> & now) {
+    if (!graph->has_captured_props || graph->captured_props.size() != now.size()) return false;
+    for (size_t i = 0; i < now.size(); ++i) {
+        if (!ggml_cuda_node_topology_equal(graph->captured_props[i], now[i])) return false;
+    }
+
+    std::vector<std::pair<void *, void *>> remap;
+    for (size_t i = 0; i < now.size(); ++i) {
+        if (graph->captured_props[i].node.data != now[i].node.data) {
+            remap.push_back({graph->captured_props[i].node.data, now[i].node.data});
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (graph->captured_props[i].node_src_data_ptrs[j] != now[i].node_src_data_ptrs[j]) {
+                remap.push_back({graph->captured_props[i].node_src_data_ptrs[j], now[i].node_src_data_ptrs[j]});
+            }
+        }
+    }
+    if (remap.empty()) return true;
+
+    size_t n = 0;
+    if (hipGraphGetNodes(graph->graph, nullptr, &n) != hipSuccess || n == 0) return false;
+    std::vector<hipGraphNode_t> nodes(n);
+    if (hipGraphGetNodes(graph->graph, nodes.data(), &n) != hipSuccess) return false;
+
+    auto lookup = [&remap](void * v) -> void * {
+        for (auto & r : remap) {
+            if (r.first == v) return r.second;
+        }
+        return v;
+    };
+
+    size_t patched = 0;
+    for (auto nd : nodes) {
+        hipKernelNodeParams p = {};
+        if (hipGraphKernelNodeGetParams(nd, &p) != hipSuccess) continue; // 커널 외 노드
+        if (p.kernelParams == nullptr) continue;
+        bool changed = false;
+        for (int a = 0; a < 64 && p.kernelParams[a] != nullptr; ++a) {
+            void * v = *(void **) p.kernelParams[a];
+            void * nv = lookup(v);
+            if (nv != v) {
+                memcpy(p.kernelParams[a], &nv, sizeof(void *));
+                changed = true;
+            }
+        }
+        if (changed) {
+            if (hipGraphExecKernelNodeSetParams(graph->instance, nd, &p) != hipSuccess) {
+                return false; // 부분 패치 상태는 재캡처로 정정
+            }
+            ++patched;
+        }
+    }
+    graph->captured_props = now;
+    return true;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4459,13 +4519,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
-                    // capture 시점과 포인터가 동일하면 순수 replay (재캡처 생략)
+                    // capture 시점과 포인터가 동일하면 순수 replay.
+                    // 다르면 선택 포인터 패치로 exec를 최신 버퍼로 갱신하고 replay,
+                    // 패치 불가(신규 버퍼/토폴로지 변화)일 때만 재캡처한다.
                     bool same_as_captured = graph->has_captured_props &&
                         graph->captured_props.size() == graph->node_props.size();
                     for (size_t i = 0; same_as_captured && i < graph->node_props.size(); ++i) {
                         same_as_captured = ggml_cuda_node_props_equal(graph->captured_props[i], graph->node_props[i]);
                     }
-                    cuda_graph_update_required = !same_as_captured || graph->instance == nullptr;
+                    if (same_as_captured || graph->instance == nullptr) {
+                        cuda_graph_update_required = graph->instance == nullptr;
+                    } else if (ggml_cuda_graph_patch_pointers(graph, graph->node_props)) {
+                        cuda_graph_update_required = false;
+                    } else {
+                        cuda_graph_update_required = true;
+                    }
                 }
             }
         }
