@@ -2694,6 +2694,47 @@ static ggml_cuda_graph_verdict ggml_cuda_graph_update_required(ggml_backend_cuda
     if (graph_dbg) {
         fprintf(stderr, "%s: uid cgraph=%zu stored=%zu n_nodes=%d\n", __func__, cgraph->uid, graph->uid, cgraph->n_nodes);
     }
+    // 디버그: 동일 노드 수의 이전 그래프 대비 최초로 달라진 bake 포인터 지목 (새 키 원인 규명용)
+    static std::vector<ggml_cuda_graph::node_properties> dbg_prev;
+    if (graph_dbg && cgraph->n_nodes > 100) {
+        if (dbg_prev.size() == (size_t) cgraph->n_nodes) {
+            int shown = 0;
+            for (int i = 0; i < cgraph->n_nodes && shown < 3; ++i) {
+                const ggml_tensor * x = &dbg_prev[i].node;
+                const ggml_tensor * y = cgraph->nodes[i];
+                if (x->data != y->data) {
+                    fprintf(stderr, "KEYDIFF[%d] op=%s name=%s DATA %p->%p\n", i, ggml_op_name(y->op), y->name, x->data, y->data);
+                    ++shown;
+                    continue;
+                }
+                if (memcmp(x->ne, y->ne, sizeof(x->ne)) != 0 || memcmp(x->nb, y->nb, sizeof(x->nb)) != 0) {
+                    fprintf(stderr, "KEYDIFF[%d] op=%s name=%s SHAPE ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld]\n",
+                            i, ggml_op_name(y->op), y->name,
+                            (long long)y->ne[0], (long long)y->ne[1], (long long)y->ne[2], (long long)y->ne[3],
+                            (long long)y->nb[0], (long long)y->nb[1], (long long)y->nb[2], (long long)y->nb[3]);
+                    ++shown;
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const void * pa = dbg_prev[i].node_src_data_ptrs[j];
+                    const void * pb = y->src[j] ? y->src[j]->data : nullptr;
+                    if (pa != pb) {
+                        fprintf(stderr, "KEYDIFF[%d] op=%s name=%s SRC%d(%s) %p->%p\n", i, ggml_op_name(y->op), y->name,
+                                j, y->src[j] ? y->src[j]->name : "?", pa, pb);
+                        ++shown;
+                        break;
+                    }
+                }
+            }
+        }
+        dbg_prev.resize(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            dbg_prev[i].node = *cgraph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                dbg_prev[i].node_src_data_ptrs[j] = cgraph->nodes[i]->src[j] ? cgraph->nodes[i]->src[j]->data : nullptr;
+            }
+        }
+    }
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
