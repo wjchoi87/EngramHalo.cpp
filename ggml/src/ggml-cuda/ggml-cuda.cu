@@ -4398,7 +4398,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
                 if (c6dbg) fprintf(stderr, "C6 MISS xn-layout %s n=%p\n", sig->name, (void *) xn);
             } else if (c6dbg && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID) {
-                fprintf(stderr, "C6 SKIP next=%s sigtype=%d\n", ggml_op_name(mul->op), (int) sig->type);
+                const int c_mul_t = (int)(mul->type == GGML_TYPE_F32);
+                const int c_lay   = (int) ggml_are_same_layout(sig, mul);
+                const int c_cs    = (int) ggml_is_contiguous(sig);
+                const int c_cm    = (int) ggml_is_contiguous(mul);
+                fprintf(stderr, "C6 SKIP next=%s sigtype=%d mul_t=%d lay=%d cs=%d cm=%d sig_ne=[%lld,%lld] mul_ne=[%lld,%lld] sig_nb1=%lld mul_nb1=%lld\n",
+                        ggml_op_name(mul->op), (int) sig->type, c_mul_t, c_lay, c_cs, c_cm,
+                        (long long) sig->ne[0], (long long) sig->ne[1],
+                        (long long) mul->ne[0], (long long) mul->ne[1],
+                        (long long) sig->nb[1], (long long) mul->nb[1]);
             }
         }
 

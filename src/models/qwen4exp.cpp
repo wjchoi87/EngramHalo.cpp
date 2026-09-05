@@ -412,6 +412,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
+    // [WonjinHALO] collapse 체인(view+cont+add×(C-1)+scale)을 cgraph에서 인접 배치 —
+    // CUDA 그래프 퓨전 매처의 adjacency 전제 (GGML_CUDA_HCFUSION).
+    ggml_build_forward_expand(gf, gated);
+
     // collapse the streams by their mean
     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
             ggml_row_size(gated->type, n_embd) * hc, 0);
@@ -448,6 +452,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+
+    // [WonjinHALO] w 체인(scale+sigmoid+scale)을 cgraph에서 인접 배치 (퓨전 adjacency)
+    ggml_build_forward_expand(gf, w);
 
     ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
     cb(cur, "hc_combine", il);
