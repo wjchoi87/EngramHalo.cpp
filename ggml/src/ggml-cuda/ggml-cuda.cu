@@ -4703,6 +4703,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
             }
+            // [B-extended 게이트 계측] 재캡처 원인 자동 분류 (env GGML_CUDA_GRAPH_KEYDIFF=1)
+            // 전역 "직전 동규모 캡처 props" 대비 diff — 연속 동형 청크 간 변화 = 재캡처 원인
+            {
+                static const bool keydiff = getenv("GGML_CUDA_GRAPH_KEYDIFF") != nullptr;
+                static long kd_seq = -1;
+                static std::vector<ggml_cuda_graph::node_properties> kd_prev;
+                if (keydiff && graph->node_props.size() > 100) {
+                    int gdn = 0, kv = 0, hc = 0, shape = 0, oth = 0, chg = 0;
+                    if (kd_prev.size() == graph->node_props.size()) {
+                        for (size_t ni = 0; ni < graph->node_props.size(); ++ni) {
+                            const auto & o = kd_prev[ni].node;
+                            const auto & w = graph->node_props[ni].node;
+                            bool ne_diff = memcmp(o.ne, w.ne, sizeof(o.ne)) != 0;
+                            bool ptr_diff = (o.data != w.data);
+                            bool src_diff = false;
+                            for (int j = 0; j < GGML_MAX_SRC; ++j)
+                                if (kd_prev[ni].node_src_data_ptrs[j] != graph->node_props[ni].node_src_data_ptrs[j]) src_diff = true;
+                            if (!ne_diff && !ptr_diff && !src_diff) continue;
+                            ++chg;
+                            const char * nm = w.name ? w.name : "";
+                            if (strstr(nm, "cache_r") || strstr(nm, "cache_s")) ++gdn;
+                            else if (strstr(nm, "cache_k") || strstr(nm, "cache_v")) ++kv;
+                            else if (strstr(nm, "hc_")) ++hc;
+                            if (ne_diff) ++shape;
+                        }
+                    }
+                    ++kd_seq;
+                    fprintf(stderr, "KEYDIFF[%ld] nodes=%zu chg=%d shape_chg=%d gdn=%d kv=%d hc=%d other=%d\n",
+                            kd_seq - 1, graph->node_props.size(), chg, shape, gdn, kv, hc, oth);
+                    // 현재 props를 다음 비교 기준으로 저장
+                    kd_prev = graph->node_props;
+                }
+            }
             // capture 시점의 props를 저장 — 다음 호출이 동일 포인터면 순수 replay로 스킵
             graph->captured_props = graph->node_props;
             graph->has_captured_props = true;
