@@ -300,13 +300,15 @@ llama_kv_cache::llama_kv_cache(
         {
             static const bool kpoison = getenv("GGML_KV_KPOISON") != nullptr;
             if (kpoison) {
-                LLAMA_LOG_INFO("%s: poison block entered (buf=%s)\n", __func__, ggml_backend_buffer_name(buf));
+                fprintf(stderr, "[KPOISON] block entered (buf=%s)\n", ggml_backend_buffer_name(buf));
+                fflush(stderr);
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                    if (strstr(t->name, "cache_k") != nullptr && t->buffer != nullptr && (strstr(ggml_backend_buffer_name(t->buffer), "CUDA") != nullptr || strstr(ggml_backend_buffer_name(t->buffer), "ROCm") != nullptr)) {
+                    if (strstr(t->name, "cache_k") != nullptr && t->buffer != nullptr && t->data != nullptr && (strstr(ggml_backend_buffer_name(t->buffer), "CUDA") != nullptr || strstr(ggml_backend_buffer_name(t->buffer), "ROCm") != nullptr)) {
                         ggml_backend_tensor_memset(t, 0xFF, 0, ggml_nbytes(t)); // 0xFF.. = f32 NaN
                     }
                 }
-                LLAMA_LOG_INFO("%s: K cache poisoned with NaN (GGML_KV_KPOISON)\n", __func__);
+                fprintf(stderr, "[KPOISON] K cache poisoned with NaN\n");
+                fflush(stderr);
             }
         }
         ctxs_bufs.emplace_back(std::move(ctx), buf);

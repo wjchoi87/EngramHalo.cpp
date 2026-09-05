@@ -80,6 +80,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cmath>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -4914,6 +4915,85 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    // [진단] GGML_CUDA_GRAPH_NANSCAN=1: compute 후 노드 출력을 앞에서부터 훑어 첫 비유한값 출력을 지목.
+    // K-포ison(sentinel) 실험에서 padding 셀이 어떤 연산에서 최초로 출력에 유입되는지 국소화용.
+    // 디버그 전용: 매 노드 sync + 샘플 D2H라 매우 느리다. 첫 비유한 노드 발견 후 해당 노드부터 스킵해 재발 방지.
+    {
+        static const bool nan_scan = getenv("GGML_CUDA_GRAPH_NANSCAN") != nullptr;
+        static int64_t nan_skip_uid = -1;
+        if (nan_scan && cgraph->n_nodes > 100 && (int64_t) cgraph->uid != nan_skip_uid) {
+            ggml_backend_cuda_synchronize(backend);
+            std::vector<float> sbuf(512);
+            int reported = 0;
+            for (int i = 0; i < cgraph->n_nodes && reported < 5; ++i) {   // 첫 5개까지만 보고 (HC 기생 NaN이 선행 숨김 방지)
+                const ggml_tensor * dst = cgraph->nodes[i];
+                if (dst->data == nullptr || ggml_nbytes(dst) == 0) {
+                    continue;
+                }
+                const int type_ok = dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16;
+                if (!type_ok) {
+                    continue;
+                }
+                const size_t n_bytes = ggml_nbytes(dst);
+                const size_t elem_sz = ggml_element_size(dst);
+                const size_t n_elem  = n_bytes / elem_sz;
+                bool bad = false;
+                if (dst->type == GGML_TYPE_F32) {
+                    for (size_t off = 0; off < n_elem && !bad; off += 512) {
+                        const size_t cnt = std::min<size_t>(512, n_elem - off);
+                        CUDA_CHECK(cudaMemcpy(sbuf.data(), (const float *) dst->data + off, cnt * 4, cudaMemcpyDeviceToHost));
+                        for (size_t k = 0; k < cnt; ++k) {
+                            if (!std::isfinite(sbuf[k])) {
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    std::vector<uint16_t> h16(512);
+                    for (size_t off = 0; off < n_elem && !bad; off += 512) {
+                        const size_t cnt = std::min<size_t>(512, n_elem - off);
+                        CUDA_CHECK(cudaMemcpy(h16.data(), (const __half *) dst->data + off, cnt * 2, cudaMemcpyDeviceToHost));
+                        for (size_t k = 0; k < cnt; ++k) {
+                            const __half h = __ushort_as_half(h16[k]);
+                            if (!std::isfinite(__half2float(h))) {
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (bad) {
+                    // 첫 비유한 요소 선형 인덱스 (strided 샘플이 아닌 전체 스캔으로 정확히)
+                    int64_t bad_idx = -1;
+                    int bad_cnt = 0;
+                    if (dst->type == GGML_TYPE_F32) {
+                        std::vector<float> full(n_elem);
+                        CUDA_CHECK(cudaMemcpy(full.data(), dst->data, n_bytes, cudaMemcpyDeviceToHost));
+                        for (size_t k = 0; k < n_elem; ++k) {
+                            if (!std::isfinite(full[k])) { if (bad_idx < 0) bad_idx = (int64_t) k; ++bad_cnt; }
+                        }
+                    }
+                    fprintf(stderr, "NANSCAN first-nonfinite node#%d/%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] badcnt=%d firstbad=%lld src0=%s(%lld,%lld) src1=%s(%lld,%lld) uid=%zu n_nodes=%d\n",
+                            i, cgraph->n_nodes, ggml_op_name(dst->op), dst->name,
+                            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                            bad_cnt, (long long) bad_idx,
+                            dst->src[0] ? dst->src[0]->name : "-",
+                            dst->src[0] ? (long long) dst->src[0]->ne[0] : 0,
+                            dst->src[0] ? (long long) dst->src[0]->ne[1] : 0,
+                            dst->src[1] ? dst->src[1]->name : "-",
+                            dst->src[1] ? (long long) dst->src[1]->ne[0] : 0,
+                            dst->src[1] ? (long long) dst->src[1]->ne[1] : 0,
+                            cgraph->uid, cgraph->n_nodes);
+                    ++reported;
+                }
+            }
+            if (reported) {
+                nan_skip_uid = (int64_t) cgraph->uid;   // 이후 동일 cgraph 스캔 생략 (다음 새 cgraph에서 재시도)
+            }
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
