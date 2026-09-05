@@ -308,12 +308,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
-    // [P0 수정] q4_0_rocmfp4/FAST: 소배치(9..63) MMQ 타일 경로가 유한 input에서 -inf를 생성한다
-    //   (측정: ple_key M=9 → output 2648개 -inf; CPU ref는 max|v|=0.074 — 원리 미해결, 회피).
-    //   M<=8은 MMVQ(정상이 검증됨), M>=64는 WMMA/prefill 경로가 선점하므로
-    //   MMQ는 ne11>=64에서만 허용 — 그 미만은 cuBLAS dequant 경로로 폴백.
-    //   근본 원인 규명 시 이 게이트를 되돌린다 (§124).
-    if ((type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) && ne11 < 64) {
+    // [P0 수정 v2] q4_0_rocmfp4/FAST: MMQ 타일 경로가 유한 input에서 -inf를 생성한다
+    //   (측정: M=9..29 창 + M=77에서도 재발 — ab_ns_256.log uid=164 nancnt=10686;
+    //    CPU ref는 max|v|=0.074 — 유한 입력에 비유한 출력 = 커널 결함, 원리 미해결).
+    //   회피: MMQ 전면 비활성. M<=8 → MMVQ(정상 검증), M%32==0&&M>=64 → WMMA(정상 검증),
+    //   나머지 → cuBLAS dequant 폴백 (to_fp16 레지스트리 케이스 77b9d4b에서 추가됨).
+    //   근본 원인 규명 시 이 게이트를 되돌린다 (§124/§125 DEBT-ROCMFP4-MMQ-SMALLBATCH).
+    if (type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
         return false;
     }
 
