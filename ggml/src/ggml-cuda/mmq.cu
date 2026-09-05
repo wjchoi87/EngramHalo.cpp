@@ -308,6 +308,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
+    // [P0 수정] q4_0_rocmfp4/FAST: 소배치(9..63) MMQ 타일 경로가 유한 input에서 -inf를 생성한다
+    //   (측정: ple_key M=9 → output 2648개 -inf; CPU ref는 max|v|=0.074 — 원리 미해결, 회피).
+    //   M<=8은 MMVQ(정상이 검증됨), M>=64는 WMMA/prefill 경로가 선점하므로
+    //   MMQ는 ne11>=64에서만 허용 — 그 미만은 cuBLAS dequant 경로로 폴백.
+    //   근본 원인 규명 시 이 게이트를 되돌린다 (§124).
+    if ((type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) && ne11 < 64) {
+        return false;
+    }
+
     // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
     {
         const int    id    = ggml_cuda_get_device();

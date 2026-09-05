@@ -615,6 +615,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_Q4_0_ROCMFP4:
+            return dequantize_row_rocmfp4_hip;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            return dequantize_row_rocmfp4_fast_hip;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
         case GGML_TYPE_F32:
