@@ -66,11 +66,13 @@ static __global__ void hc_silu_scale_f32(const float * __restrict__ mm, float * 
     out[idx] = __fdiv_rn(t, 1.0f + expf(-t));
 }
 
-// 게이트: GGML_CUDA_HCFUSION=0으로 명시 비활성화하지 않는 한 활성 (기본 ON — 승인된 Task C).
+// 게이트: GGML_CUDA_HCFUSION=1로 opt-in (기본 OFF).
+// Task C 판정: cgraph 인접성 문제로 C2만 발동, end-to-end 개선 <10% → 실패 판정(§121-a)에 따라 기본 OFF.
+// 재개 조건: cgraph 인접성 확정(빌더 재배선 검증) 후 기본 ON 전환 검토.
 inline bool hc_fuse_enabled() {
     static const bool enabled = [] {
         const char * t = getenv("GGML_CUDA_HCFUSION");
-        return !(t && t[0] && t[0] == '0' && t[1] == '\0');
+        return t && t[0] && !(t[0] == '0' && t[1] == '\0');
     }();
     return enabled;
 }
