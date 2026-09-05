@@ -4482,6 +4482,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 // [§126] recapture 구간 wall 측정 (BeginCapture → GraphLaunch) — graph_compute와 evaluate_and_capture가 공유
 static long g_capwall_t0 = 0;
+// [§128 E2] eager 분해: per-node dispatch CPU 누적 + eager reason
+static long long g_e2_dispatch_us = 0;
+static long g_e2_dispatch_n = 0;
+static const char * g_eager_reason = "unknown";
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
@@ -4675,7 +4679,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         (void) any;
                     }
                 }
+                const bool e2_active = getenv("GGML_CUDA_E2TRACE") != nullptr && !use_cuda_graph;
+                const long long e2_t0 = e2_active ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (e2_active) { g_e2_dispatch_us += ggml_time_us() - e2_t0; ++g_e2_dispatch_n; }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5023,6 +5030,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    g_eager_reason = "no-graph";
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -5040,7 +5048,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Warmup: 토폴로지가 동일한 호출이 2회 연속이면 capture로 진입한다.
                 // bake 포인터(data/src-data/op_params)는 호출마다 바뀔 수 있으나 capture가
                 // 현재 포인터로 기록하므로 정확성에 영향 없음.
-                if (!verdict.topology_changed) {
+                if (verdict.topology_changed) g_eager_reason = "warmup-topo-changed";
+if (!verdict.topology_changed) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
@@ -5051,6 +5060,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Post-warmup: 토폴로지 동일 — 포인터가 같으면 순수 replay, 다르면 재캡처.
                 if (verdict.topology_changed) {
                     graph->warmup_complete = false;
+                    g_eager_reason = "topo-reset";
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -5093,13 +5103,33 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // [§127] WALLMODE eager: 그래프를 쓰지 않는 실행(warmup/미지원)의 dispatch wall
     static const bool wm_dbg = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
-    long wm_t0 = wm_dbg ? ggml_time_us() : 0;
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-    if (wm_dbg && !use_cuda_graph && cgraph->n_nodes > 100) {
-        fprintf(stderr, "WALLMODE mode=eager n_nodes=%d us=%lld\n", (int) cgraph->n_nodes, (long long)(ggml_time_us() - wm_t0));
+    // [§128 E2] eager 분해: GPU busy(cudaEvent) + CPU dispatch 누적
+    static const bool e2_trace = getenv("GGML_CUDA_E2TRACE") != nullptr;
+    static cudaEvent_t e2_ev[2] = {nullptr, nullptr};
+    if (e2_trace && !use_cuda_graph && cgraph->n_nodes > 100 && e2_ev[0] == nullptr) {
+        hipEventCreate(&e2_ev[0]); hipEventCreate(&e2_ev[1]);
     }
+    long wm_t0 = (wm_dbg || e2_trace) ? ggml_time_us() : 0;
+    const bool e2_this = e2_trace && !use_cuda_graph && cgraph->n_nodes > 100;
+    if (e2_this) { CUDA_CHECK(cudaEventRecord(e2_ev[0], cuda_ctx->stream())); }
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     if (wm_dbg && use_cuda_graph && !cuda_graph_update_required) {
         fprintf(stderr, "WALLMODE mode=replay n_nodes=%d us=%lld\n", (int) cgraph->n_nodes, (long long)(ggml_time_us() - wm_t0));
+    }
+    if (wm_dbg && !use_cuda_graph && cgraph->n_nodes > 100) {
+        fprintf(stderr, "WALLMODE mode=eager n_nodes=%d us=%lld reason=%s\n",
+                (int) cgraph->n_nodes, (long long)(ggml_time_us() - wm_t0), g_eager_reason);
+    }
+    if (e2_this) {
+        CUDA_CHECK(cudaEventRecord(e2_ev[1], cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(e2_ev[1]));
+        const long long wall_us = ggml_time_us() - wm_t0;
+        float gpu_ms = 0.f;
+        hipEventElapsedTime(&gpu_ms, e2_ev[0], e2_ev[1]);
+        fprintf(stderr, "E2 n_nodes=%d wall_us=%lld dispatch_us=%lld dispatch_n=%d gpu_ms=%.1f reason=%s\n",
+                (int) cgraph->n_nodes, (long long) wall_us, (long long) g_e2_dispatch_us,
+                g_e2_dispatch_n, gpu_ms, g_eager_reason);
+        g_e2_dispatch_us = 0; g_e2_dispatch_n = 0;
     }
 
     // [진단] GGML_CUDA_GRAPH_NANSCAN=1: compute 후 노드 출력을 앞에서부터 훑어 첫 비유한값 출력을 지목.
