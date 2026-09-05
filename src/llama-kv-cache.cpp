@@ -101,6 +101,16 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // [D1-safe] n_pad가 kv_size를 나누지 못하면(예: 노브로 큰 버킷 지정 시) kv_size 이하의
+    // 최대 2의 거듭제곱 약수로 내림한다 — 크래시 대신 안전한 버킷 고정.
+    if (n_pad > 1 && kv_size % n_pad != 0) {
+        uint32_t safe = n_pad;
+        while (safe > 1 && kv_size % safe != 0) safe /= 2;
+        if (safe < 1) safe = 1;
+        LLAMA_LOG_WARN("%s: kv_size = %u is not divisible by n_pad = %u, clamping to %u\n", __func__, kv_size, n_pad, safe);
+        n_pad = safe;
+    }
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
