@@ -2543,13 +2543,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
+                        // [D1] n_kv 버킷을 노브로 고정: get_n_kv 증가(토폴로지 변화)로 인한 ubatch당
+                        // eager 재실행을 억제 — capture/재캡처·replay 경로가 유지되도록 함 (§129).
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
+                            /* attn_n_pad        */ llama_kv_n_pad_env(),
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,

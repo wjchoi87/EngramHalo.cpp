@@ -4486,6 +4486,7 @@ static long g_capwall_t0 = 0;
 static long long g_e2_dispatch_us = 0;
 static long g_e2_dispatch_n = 0;
 static const char * g_eager_reason = "unknown";
+static std::map<std::string, long long> g_e2_op_us;   // [E3] op별 dispatch wall
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
@@ -4682,7 +4683,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 const bool e2_active = getenv("GGML_CUDA_E2TRACE") != nullptr && !use_cuda_graph;
                 const long long e2_t0 = e2_active ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-                if (e2_active) { g_e2_dispatch_us += ggml_time_us() - e2_t0; ++g_e2_dispatch_n; }
+                if (e2_active) {
+                    const long long d = ggml_time_us() - e2_t0;
+                    g_e2_dispatch_us += d; ++g_e2_dispatch_n;
+                    // [E3] op별 dispatch 시간 누적 — 330μs/launch의 분포 규명
+                    g_e2_op_us[ggml_op_name(node->op)] += d;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5129,7 +5135,17 @@ if (!verdict.topology_changed) {
         fprintf(stderr, "E2 n_nodes=%d wall_us=%lld dispatch_us=%lld dispatch_n=%d gpu_ms=%.1f reason=%s\n",
                 (int) cgraph->n_nodes, (long long) wall_us, (long long) g_e2_dispatch_us,
                 g_e2_dispatch_n, gpu_ms, g_eager_reason);
-        g_e2_dispatch_us = 0; g_e2_dispatch_n = 0;
+        static int e2_op_cnt = 0;
+        if (++e2_op_cnt % 25 == 1) {   // 상위 op 분해 (25그래프마다 1회)
+            std::vector<std::pair<long long, std::string>> ops;
+            for (auto & kv : g_e2_op_us) ops.push_back({kv.second, kv.first});
+            std::sort(ops.rbegin(), ops.rend());
+            fprintf(stderr, "E2OPS n=%lld:", (long long) g_e2_dispatch_n);
+            for (int q = 0; q < 8 && q < (int) ops.size(); ++q)
+                fprintf(stderr, " %s=%.1fms", ops[q].second.c_str(), ops[q].first / 1000.0);
+            fprintf(stderr, "\n");
+        }
+        g_e2_dispatch_us = 0; g_e2_dispatch_n = 0; g_e2_op_us.clear();
     }
 
     // [진단] GGML_CUDA_GRAPH_NANSCAN=1: compute 후 노드 출력을 앞에서부터 훑어 첫 비유한값 출력을 지목.
