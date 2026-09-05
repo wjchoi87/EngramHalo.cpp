@@ -78,6 +78,8 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
+#include <set>
 #include <cstdint>
 #include <cfloat>
 #include <cmath>
@@ -4866,7 +4868,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static std::vector<ggml_cuda_graph::node_properties> kd_prev;
                 if (keydiff && graph->node_props.size() > 100) {
                     int gdn = 0, kv = 0, hc = 0, shape = 0, oth = 0, chg = 0;
-                    int tail = 0, kvshape = 0;   // [§126] tail = ne[2]가 full ubatch(128)와 다른 shape 변화, kvshape = ne[1](n_kv 차원) 변화
+                    int tail = 0, kvshape = 0, kvderived = 0;   // [§127] kvderived = shape 변화 노드 중 src 체인이 cache_k/v에 도달
+                    // src 체인 도달성 (재귀 + 방문 캐시, 깊이 6 제한)
+                    std::set<const ggml_tensor *> kvvisited;
+                    std::function<bool(const ggml_tensor *, int)> reaches_kv = [&](const ggml_tensor * t, int depth) -> bool {
+                        if (!t || depth > 6 || kvvisited.count(t)) return false;
+                        kvvisited.insert(t);
+                        if (t->name && (strstr(t->name, "cache_k") || strstr(t->name, "cache_v"))) return true;
+                        for (int j = 0; j < GGML_MAX_SRC; ++j)
+                            if (reaches_kv(t->src[j], depth + 1)) return true;
+                        return false;
+                    };
                     if (kd_prev.size() == graph->node_props.size()) {
                         for (size_t ni = 0; ni < graph->node_props.size(); ++ni) {
                             const auto & o = kd_prev[ni].node;
@@ -4886,12 +4898,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 ++shape;
                                 if (w.ne[2] != 128) ++tail;              // 부분 ubatch 토큰 차원
                                 if (strstr(nm, "cache_k") || strstr(nm, "cache_v")) ++kvshape;
+                                if (reaches_kv(cgraph->nodes[ni], 0)) ++kvderived;   // n_kv 파생 뷰 전체
                             }
                         }
                     }
                     ++kd_seq;
-                    fprintf(stderr, "KEYDIFF[%ld] nodes=%zu chg=%d shape_chg=%d gdn=%d kv=%d hc=%d other=%d tail=%d kvshape=%d\n",
-                            kd_seq - 1, graph->node_props.size(), chg, shape, gdn, kv, hc, oth, tail, kvshape);
+                    fprintf(stderr, "KEYDIFF[%ld] nodes=%zu chg=%d shape_chg=%d gdn=%d kv=%d hc=%d other=%d tail=%d kvshape=%d kvderived=%d\n",
+                            kd_seq - 1, graph->node_props.size(), chg, shape, gdn, kv, hc, oth, tail, kvshape, kvderived);
                     // 현재 props를 다음 비교 기준으로 저장
                     kd_prev = graph->node_props;
                 }
@@ -5078,7 +5091,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // [§127] WALLMODE eager: 그래프를 쓰지 않는 실행(warmup/미지원)의 dispatch wall
+    static const bool wm_dbg = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+    long wm_t0 = wm_dbg ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (wm_dbg && !use_cuda_graph && cgraph->n_nodes > 100) {
+        fprintf(stderr, "WALLMODE mode=eager n_nodes=%d us=%lld\n", (int) cgraph->n_nodes, (long long)(ggml_time_us() - wm_t0));
+    }
+    if (wm_dbg && use_cuda_graph && !cuda_graph_update_required) {
+        fprintf(stderr, "WALLMODE mode=replay n_nodes=%d us=%lld\n", (int) cgraph->n_nodes, (long long)(ggml_time_us() - wm_t0));
+    }
 
     // [진단] GGML_CUDA_GRAPH_NANSCAN=1: compute 후 노드 출력을 앞에서부터 훑어 첫 비유한값 출력을 지목.
     // K-포ison(sentinel) 실험에서 padding 셀이 어떤 연산에서 최초로 출력에 유입되는지 국소화용.
