@@ -1,6 +1,7 @@
 #include "llama-kv-cache.h"
 #include <cstdio>
 #include <cstdlib>
+#include "ggml-backend.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -294,6 +295,20 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+        // [sentinel 실험] GGML_KV_KPOISON=1: K 캐시를 NaN으로 채움 — 미기록(padding) 셀이
+        // 어텐션/인덱서 경로에 유입되면 NaN으로 즉시 검출된다 (마스크 커버리지 검증용).
+        {
+            static const bool kpoison = getenv("GGML_KV_KPOISON") != nullptr;
+            if (kpoison) {
+                LLAMA_LOG_INFO("%s: poison block entered (buf=%s)\n", __func__, ggml_backend_buffer_name(buf));
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    if (strstr(t->name, "cache_k") != nullptr && t->buffer != nullptr && (strstr(ggml_backend_buffer_name(t->buffer), "CUDA") != nullptr || strstr(ggml_backend_buffer_name(t->buffer), "ROCm") != nullptr)) {
+                        ggml_backend_tensor_memset(t, 0xFF, 0, ggml_nbytes(t)); // 0xFF.. = f32 NaN
+                    }
+                }
+                LLAMA_LOG_INFO("%s: K cache poisoned with NaN (GGML_KV_KPOISON)\n", __func__);
+            }
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
