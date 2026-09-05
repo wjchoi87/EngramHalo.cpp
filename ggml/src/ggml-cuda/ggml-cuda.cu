@@ -2695,6 +2695,8 @@ static bool ggml_cuda_graph_snap_kernels(ggml_cuda_graph * graph, std::vector<gg
         return t && t[0] && !(t[0] == '0' && t[1] == '\0');
     }();
     if (!audit_enabled) return false;
+    // 안전 가드: kernelParams 엔트리의 유효 포인터만 역참조 (dangling storage 대응)
+    static const uintptr_t ptr_floor = 0x10000;
     // 주의: AUDIT=1은 이 플랫폼(HIP 7.2 + 커스텀 커널 7.0.0-30)에서 capture 후 GetParams의
     // kernelParams storage가 dangling을 반환해 segfault를 재현한다 (§118).
     size_t n = 0;
@@ -2709,10 +2711,14 @@ static bool ggml_cuda_graph_snap_kernels(ggml_cuda_graph * graph, std::vector<gg
         ks.func = p.func;
         ks.grid = p.gridDim;
         ks.block = p.blockDim;
+        // 슬롯 "값"(포인터 값 또는 스칼라 비트)만 8B 스냅샷 — 대상 메모리 역참조 금지
+        // (디바이스 버퍼는 호스트 매핑이 없어 역참조 시 segfault, §118 근본 결함).
         if (p.kernelParams != nullptr) {
-            for (int a = 0; a < 32 && p.kernelParams[a] != nullptr; ++a) {
-                const uint8_t * src = (const uint8_t *) p.kernelParams[a];
-                ks.arg_bytes.insert(ks.arg_bytes.end(), src, src + 16);
+            for (int a = 0; a < 8 && p.kernelParams[a] != nullptr; ++a) {
+                uint64_t v = 0;
+                memcpy(&v, p.kernelParams[a], sizeof(uint64_t) < 16 ? sizeof(uint64_t) : 8);
+                const uint8_t * vb = (const uint8_t *) &v;
+                ks.arg_bytes.insert(ks.arg_bytes.end(), vb, vb + 8);
                 ks.n_args++;
             }
         }
@@ -4674,13 +4680,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         graph->has_kernel_snaps[0] = true;
                     } else if (!graph->patch_verified && !graph->no_replay) {
                         const int unknown = ggml_cuda_graph_audit_diff(graph->kernel_snaps[0], snap, remap, "graph");
+                        static const bool audit_dbg = getenv("GGML_CUDA_HCFUSION_DEBUG") != nullptr;
                         if (unknown == 0) {
                             graph->patch_verified = true;
-                            GGML_LOG_DEBUG("%s: bake-schema audit passed — safe patch replay enabled\n", __func__);
+                            if (audit_dbg) fprintf(stderr, "AUDIT PASS graph=%p kernels=%zu unknown=0 — safe patch replay ON\n", (void *) graph, snap.size());
                         } else {
                             graph->no_replay = true;
                             graph->kernel_snaps[0] = std::move(snap);
-                            GGML_LOG_DEBUG("%s: bake-schema audit found %d unknown — replay disabled\n", __func__, unknown);
+                            if (audit_dbg) fprintf(stderr, "AUDIT FAIL graph=%p unknown=%d — replay disabled (recapture only)\n", (void *) graph, unknown);
                         }
                     } else {
                         graph->kernel_snaps[1] = std::move(snap);
