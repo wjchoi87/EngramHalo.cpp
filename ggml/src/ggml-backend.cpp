@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -1655,16 +1656,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // E-계측: split별 backend/노드/wall + sync·copy 횟수 (env GGML_SCHED_TRACE)
+    static const bool sched_trace = getenv("GGML_SCHED_TRACE") != nullptr;
+    static long trace_seq = 0;
+    const long trace_id = ++trace_seq;
+    int64_t tr_t0 = ggml_time_us();
+    int tr_n_cpu = 0, tr_n_ev_wait = 0, tr_n_ev_sync = 0, tr_n_backend_sync = 0, tr_n_copy = 0;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
 
+    (void) tr_t0; (void) tr_n_cpu; (void) tr_n_ev_wait; (void) tr_n_ev_sync; (void) tr_n_backend_sync; (void) tr_n_copy;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t tr_split_t0 = sched_trace ? ggml_time_us() : 0;
+        // 입력 copy/sync 구간 이후 graph_compute 직전 시점을 잡기 위한 플래그
+        bool tr_compute_logged = false;
+        int64_t tr_compute_t0 = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1800,6 +1813,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            if (sched_trace && !tr_compute_logged) {
+                tr_compute_t0 = ggml_time_us();
+                fprintf(stderr, "SPLITPRE[%ld] #%d backend=%s pre_us=%lld ops=", trace_id, split_id,
+                        ggml_backend_name(split_backend), (long long)(tr_compute_t0 - tr_split_t0));
+                for (int j = 0; j < split->graph.n_nodes && j < 4; ++j) {
+                    fprintf(stderr, "%s%s", j ? "," : "", ggml_op_name(split->graph.nodes[j]->op));
+                }
+                fprintf(stderr, "\n");
+                tr_compute_logged = true;
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1841,6 +1864,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+        if (sched_trace) {
+            fprintf(stderr, "SPLIT[%ld] #%d backend=%s n_nodes=%d wall_us=%lld compute_us=%lld\n",
+                    trace_id, split_id, ggml_backend_name(split_backend),
+                    split->graph.n_nodes, (long long)(ggml_time_us() - tr_split_t0),
+                    tr_compute_logged ? (long long)(ggml_time_us() - tr_compute_t0) : -1);
         }
 
         prev_backend_id = split_backend_id;
