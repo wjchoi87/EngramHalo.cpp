@@ -4478,6 +4478,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [§126] recapture 구간 wall 측정 (BeginCapture → GraphLaunch) — graph_compute와 evaluate_and_capture가 공유
+static long g_capwall_t0 = 0;
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4863,6 +4866,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static std::vector<ggml_cuda_graph::node_properties> kd_prev;
                 if (keydiff && graph->node_props.size() > 100) {
                     int gdn = 0, kv = 0, hc = 0, shape = 0, oth = 0, chg = 0;
+                    int tail = 0, kvshape = 0;   // [§126] tail = ne[2]가 full ubatch(128)와 다른 shape 변화, kvshape = ne[1](n_kv 차원) 변화
                     if (kd_prev.size() == graph->node_props.size()) {
                         for (size_t ni = 0; ni < graph->node_props.size(); ++ni) {
                             const auto & o = kd_prev[ni].node;
@@ -4878,12 +4882,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (strstr(nm, "cache_r") || strstr(nm, "cache_s")) ++gdn;
                             else if (strstr(nm, "cache_k") || strstr(nm, "cache_v")) ++kv;
                             else if (strstr(nm, "hc_")) ++hc;
-                            if (ne_diff) ++shape;
+                            if (ne_diff) {
+                                ++shape;
+                                if (w.ne[2] != 128) ++tail;              // 부분 ubatch 토큰 차원
+                                if (strstr(nm, "cache_k") || strstr(nm, "cache_v")) ++kvshape;
+                            }
                         }
                     }
                     ++kd_seq;
-                    fprintf(stderr, "KEYDIFF[%ld] nodes=%zu chg=%d shape_chg=%d gdn=%d kv=%d hc=%d other=%d\n",
-                            kd_seq - 1, graph->node_props.size(), chg, shape, gdn, kv, hc, oth);
+                    fprintf(stderr, "KEYDIFF[%ld] nodes=%zu chg=%d shape_chg=%d gdn=%d kv=%d hc=%d other=%d tail=%d kvshape=%d\n",
+                            kd_seq - 1, graph->node_props.size(), chg, shape, gdn, kv, hc, oth, tail, kvshape);
                     // 현재 props를 다음 비교 기준으로 저장
                     kd_prev = graph->node_props;
                 }
@@ -4906,6 +4914,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (cuda_graph_update_required && getenv("GGML_CUDA_GRAPH_DEBUG")) {
+            fprintf(stderr, "CAPWALL graph=%p n_nodes=%d recapture_us=%lld\n",
+                    graph_key, (int) cgraph->n_nodes, (long long) (ggml_time_us() - g_capwall_t0));
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -5061,6 +5073,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
+        g_capwall_t0 = ggml_time_us();
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
