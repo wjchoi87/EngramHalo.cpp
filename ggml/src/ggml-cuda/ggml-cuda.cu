@@ -1839,10 +1839,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // G-1B: ROCmFP4 direct-fragment WMMA 경로 (gfx1151, prefill 크기 배치)
     if (ggml_cuda_rocmfp4_wmma_eligible(src0, src1, dst)) {
+        if (getenv("GGML_CUDA_MMQ_TRACE")) { fprintf(stderr, "MULMAT-PATH wmma K=%lld N=%lld M=%lld name=%s\n", (long long)src0->ne[0], (long long)src0->ne[1], (long long)src1->ne[1], dst->name); }
         ggml_cuda_mul_mat_rocmfp4_wmma(ctx, src0, src1, dst);
         return;
     }
 
+    if (getenv("GGML_CUDA_MMQ_TRACE") && src0->type == GGML_TYPE_Q4_0_ROCMFP4) {
+        fprintf(stderr, "MULMAT-PATH mmq? name=%s ne0=[%lld,%lld] ne1=[%lld,%lld] mmvf=%d mmf=%d mmvq=%d mmq=%d\n",
+                dst->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src1->ne[0], (long long)src1->ne[1],
+                (int)ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11),
+                (int)ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, false),
+                (int)ggml_cuda_should_use_mmvq(src0->type, cc, ne11),
+                (int)ggml_cuda_should_use_mmq(src0->type, cc, ne11, false));
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -4638,11 +4647,153 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // [v6] pre-launch src 스캔: launch 직전 src 버퍼 상태 (kernel 생성 vs overwrite 구분)
+                {
+                    static const bool nan_v6 = getenv("GGML_CUDA_GRAPH_NANSCAN_V4") != nullptr;
+                    if (nan_v6 && !use_cuda_graph && i < 200) {
+                        bool any = false;
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            const ggml_tensor * s = node->src[j];
+                            if (s && s->data && ggml_nbytes(s) > 0 && s->type == GGML_TYPE_F32) {
+                                const size_t sn = ggml_nelements(s);
+                                std::vector<float> sf(std::min<size_t>(sn, 262144));
+                                CUDA_CHECK(cudaMemcpy(sf.data(), s->data, sf.size() * 4, cudaMemcpyDeviceToHost));
+                                int nan0 = 0, inf0 = 0;
+                                for (size_t k = 0; k < sf.size(); ++k) {
+                                    if (std::isnan(sf[k])) ++nan0; else if (std::isinf(sf[k])) ++inf0;
+                                }
+                                if (nan0 || inf0) { any = true; }
+                                fprintf(stderr, "NANSCAN6-PRE uid=%zu node#%d/%d op=%s src[%d]=%s nan=%d inf=%d/%zu\n",
+                                        cgraph->uid, i, cgraph->n_nodes, ggml_op_name(node->op), j, s->name, nan0, inf0, sf.size());
+                            }
+                        }
+                        (void) any;
+                    }
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                // [v4] per-node eager NaN 스캔 (GGML_CUDA_GRAPH_NANSCAN_V4=1, graphs OFF 전용 의미):
+                // dispatch 직후 sync → 이 노드 출력은 아직 어떤 later 노드에도 재사용되지 않았으므로 판정 정확.
+                // src 판정: (a) leaf(weight/graph input)는 지금 직접 스캔 (재사용 없음), (b) 이 graph 내
+                // 선행 노드면 그 당시 스캔 결과(bad_set)를 인용 → "전파 vs 최초 생성" 확정.
+                {
+                    static const bool nan_v4 = getenv("GGML_CUDA_GRAPH_NANSCAN_V4") != nullptr;
+                    static std::map<const ggml_tensor *, bool> v4_bad;
+                    static int v4_reported = 0;
+                    static size_t v4_uid = 0;
+                    if (nan_v4 && cgraph->uid != v4_uid) {
+                        v4_uid = cgraph->uid;
+                        v4_bad.clear();       // 노드 포인터는 cgraph 간 재사용될 수 있어 uid 전환 시점 초기화 필수
+                        v4_reported = 0;
+                    }
+                    if (nan_v4 && !use_cuda_graph && v4_reported < 300) {
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        bool node_bad = false;
+                        int64_t bad_idx = -1; int bad_cnt = 0; int inf_cnt = 0;
+                        if (node->data != nullptr && ggml_nbytes(node) > 0 && node->type == GGML_TYPE_F32) {
+                            const size_t n = ggml_nelements(node);
+                            std::vector<float> full(n);
+                            CUDA_CHECK(cudaMemcpy(full.data(), node->data, n * 4, cudaMemcpyDeviceToHost));
+                            for (size_t k = 0; k < n; ++k) {
+                                // mask의 -inf는 설계값 → NaN만 오염으로 판정, inf는 별도 카운트
+                                if (std::isnan(full[k])) { if (bad_idx < 0) bad_idx = (int64_t) k; ++bad_cnt; }
+                                else if (std::isinf(full[k])) { ++inf_cnt; }
+                            }
+                            // [v5] inf도 추적: mask -inf와 구분无法이므로 inf 포함 비유한 전부 보고 (이름/연산으로 판단)
+                            node_bad = bad_cnt > 0 || inf_cnt > 0;
+                        }
+                        if (node_bad) {
+                            ++v4_reported;
+                            // 비유한 인덱스 패턴 샘플 (첫 20 + 마지막) + 개수
+                            {
+                                std::vector<int64_t> idxs;
+                                const size_t n2 = ggml_nelements(node);
+                                std::vector<float> full2(n2);
+                                CUDA_CHECK(cudaMemcpy(full2.data(), node->data, n2 * 4, cudaMemcpyDeviceToHost));
+                                int64_t last = -1;
+                                for (size_t k = 0; k < n2; ++k) {
+                                    if (!std::isfinite(full2[k])) { if (idxs.size()<20) idxs.push_back((int64_t)k); last=(int64_t)k; }
+                                }
+                                fprintf(stderr, "    INFIDX dst=%zux ne0=%lld cnt=%zu first=[", n2, (long long)node->ne[0], idxs.size()+ (last>=0? 1:0));
+                                for (size_t q=0;q<idxs.size();++q) fprintf(stderr, "%s%lld", q?",":"", (long long)idxs[q]);
+                                fprintf(stderr, "] last=%lld\n", (long long)last);
+                                {
+                                    std::map<int64_t,int> percol; for (auto v: idxs) {}
+                                    int cntc=0; for (size_t k=0;k<n2;++k) if (!std::isfinite(full2[k])) { percol[k / node->ne[0]]++; cntc++; }
+                                    fprintf(stderr, "    INFPERCOL cols=");
+                                    for (auto & pc : percol) fprintf(stderr, "%lld:%d ", (long long)pc.first, pc.second);
+                                    fprintf(stderr, "total=%d\n", cntc);
+                                }
+                            }
+                            fprintf(stderr, "NANSCAN4 uid=%zu node#%d/%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] nancnt=%d infcnt=%d firstbad=%lld\n",
+                                    cgraph->uid, i, cgraph->n_nodes, ggml_op_name(node->op), node->name,
+                                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                                    bad_cnt, inf_cnt, (long long) bad_idx);
+                            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                                const ggml_tensor * s = node->src[j];
+                                if (!s) continue;
+                                auto it = v4_bad.find(s);
+                                const char * state = it == v4_bad.end() ? "leaf/unscanned" : (it->second ? "NAN-AT-CREATE" : "clean(no-NaN)");
+                                fprintf(stderr, "  src[%d]=%s op=%s type=%s ne=[%lld,%lld,%lld,%lld] %s\n",
+                                        j, s->name, ggml_op_name(s->op), ggml_type_name(s->type),
+                                        (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3], state);
+                                if (it == v4_bad.end() && s->data != nullptr && ggml_nbytes(s) > 0 &&
+                                        (s->type == GGML_TYPE_F32 || s->type == GGML_TYPE_Q4_0_ROCMFP4 || s->type == GGML_TYPE_Q4_0_ROCMFP4_FAST)) {
+                                    if (j == 1) {
+                                        fprintf(stderr, "    NB %s: nb0=%lld nb1=%lld nb2=%lld nb3=%lld ne=[%lld,%lld,%lld,%lld] contig=%d\n",
+                                                s->name, (long long)s->nb[0], (long long)s->nb[1], (long long)s->nb[2], (long long)s->nb[3],
+                                                (long long)s->ne[0], (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3],
+                                                (int)ggml_is_contiguous(s));
+                                        // strided 관점: 실제 사용 bytes = nb1*(ne1-1)+ne0*4
+                                        const size_t used = (size_t)(s->nb[1] * (s->ne[1]-1) + ggml_nbytes(s) / s->ne[1]);
+                                        const size_t sn = used/4;
+                                        std::vector<float> sf(std::min<size_t>(sn, 1u<<20));
+                                        CUDA_CHECK(cudaMemcpy(sf.data(), s->data, sf.size()*4, cudaMemcpyDeviceToHost));
+                                        float amax=0; int nan0=0, inf0=0;
+                                        for (size_t k=0;k<sf.size();++k){ if(std::isnan(sf[k]))nan0++; else if(std::isinf(sf[k]))inf0++; else amax=std::max(amax,std::fabs(sf[k])); }
+                                        fprintf(stderr, "    STRIDED-SCAN %s: nan=%d inf=%d absmax=%g over %zu f32-slots\n", s->name, nan0, inf0, amax, sf.size());
+                                    }
+                                    // src 버퍼는 이 노드가 소비자이므로 이 순간 유효 (view 포함): absmax/nan/inf 분포
+                                    int scnt = 0, icnt = 0;
+                                    double amax = 0.0;
+                                    if (s->type == GGML_TYPE_F32) {
+                                        const size_t sn = ggml_nelements(s);
+                                        std::vector<float> sf(std::min<size_t>(sn, 4u * 1024 * 1024));
+                                        CUDA_CHECK(cudaMemcpy(sf.data(), s->data, sf.size() * 4, cudaMemcpyDeviceToHost));
+                                        for (size_t k = 0; k < sf.size(); ++k) {
+                                            if (std::isnan(sf[k])) ++scnt;
+                                            else if (std::isinf(sf[k])) ++icnt;
+                                            else { const float a = std::fabs(sf[k]); if (a > amax) amax = a; }
+                                        }
+                                        fprintf(stderr, "    src-scan %s: nan=%d inf=%d absmax=%.6g / %zu sampled (view=%d)\n",
+                                                s->name, scnt, icnt, amax, sf.size(), (int) (s->view_src != nullptr));
+                                    } else {
+                                        // q4_0_rocmfp4: qs16B+scale2B per 32-elem block — scale 바이트만 D2H 스캔
+                                        const size_t nblk = ggml_nelements(s) / 32;
+                                        const size_t scan = std::min<size_t>(nblk, 2u * 1024 * 1024);
+                                        std::vector<uint8_t> raw(scan * 18);
+                                        CUDA_CHECK(cudaMemcpy(raw.data(), s->data, raw.size(), cudaMemcpyDeviceToHost));
+                                        double fscale_max = 0.0; size_t nfin = 0;
+                                        for (size_t k = 0; k < scan; ++k) {
+                                            uint16_t bits; memcpy(&bits, &raw[k * 18 + 16], 2);
+                                            const float sc = ggml_fp16_to_fp32(bits);
+                                            if (std::isnan(sc)) ++scnt;
+                                            else if (std::isinf(sc)) ++icnt;
+                                            else { ++nfin; if (sc > fscale_max) fscale_max = sc; }
+                                        }
+                                        fprintf(stderr, "    src-scan(quant) %s: scale nan=%d inf=%d max_finite=%.6g / %zu blocks sampled\n",
+                                                s->name, scnt, icnt, fscale_max, scan);
+                                    }
+                                }
+                            }
+                        }
+                        v4_bad[node] = node_bad;
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4922,6 +5073,30 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     {
         static const bool nan_scan = getenv("GGML_CUDA_GRAPH_NANSCAN") != nullptr;
         static int64_t nan_skip_uid = -1;
+        // 리프(그래프 입력/파라미터)는 compute 후에도 버퍼가 재사용되지 않으므로
+        // 직접 스캔하면 진짜 오염 vs 중간버퍼 stale를 구분할 수 있다.
+        auto leaf_scan = [&](const ggml_tensor * s) -> int { // -1 = 스킵(비f32/리프아님), 0 = clean, >0 = badcnt
+            if (s == nullptr || s->data == nullptr || s->type != GGML_TYPE_F32) {
+                return -1;
+            }
+            bool is_leaf = (s->view_src == nullptr);
+            if (is_leaf) {
+                for (int j = 0; j < cgraph->n_nodes; ++j) {
+                    if (cgraph->nodes[j] == s) { is_leaf = false; break; }
+                }
+            }
+            if (!is_leaf) {
+                return -1;
+            }
+            const size_t n = ggml_nelements(s);
+            std::vector<float> full(n);
+            CUDA_CHECK(cudaMemcpy(full.data(), s->data, n * 4, cudaMemcpyDeviceToHost));
+            int cnt = 0;
+            for (size_t k = 0; k < n; ++k) {
+                if (!std::isfinite(full[k])) { ++cnt; }
+            }
+            return cnt;
+        };
         if (nan_scan && cgraph->n_nodes > 100 && (int64_t) cgraph->uid != nan_skip_uid) {
             ggml_backend_cuda_synchronize(backend);
             std::vector<float> sbuf(512);
@@ -4975,16 +5150,44 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                             if (!std::isfinite(full[k])) { if (bad_idx < 0) bad_idx = (int64_t) k; ++bad_cnt; }
                         }
                     }
-                    fprintf(stderr, "NANSCAN first-nonfinite node#%d/%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] badcnt=%d firstbad=%lld src0=%s(%lld,%lld) src1=%s(%lld,%lld) uid=%zu n_nodes=%d\n",
+                    // [v2] src 가짜-NaN 판별: compute 후 스캔이라 scr 버퍼는 allocator가 재사용했을 수 있다.
+                    // scr이 "실행 당시 NaN이었는지"는 이 시점 직접 검사로 알 수 없음.
+                    // 대신 scr이 leaf(모델 파라미터/입력)인지, 아니면 재사용 가능한 중간 버퍼인지 구분해 보고:
+                    // scr이 non-leaf면 stale-risk 플래그 → 원인 판정은 cgraph 내 선행 스캔 결과와 대조 필요.
+                    auto src_info = [&](const ggml_tensor * s, int & stale) -> std::string {
+                        if (!s) return "-";
+                        stale = 0;
+                        if (s->data == nullptr) return std::string("<nulldata>") + s->name;
+                        if (s->view_src != nullptr) stale = 1; // view 기반은 재사용 애매
+                        bool is_leaf = true;
+                        for (int j = 0; j < i; ++j) {
+                            if (cgraph->nodes[j] == s) { is_leaf = false; break; }
+                        }
+                        if (is_leaf) stale = 2; // graph 입력/파라미터 — stale 아님
+                        char b[256];
+                        snprintf(b, sizeof(b), "%s(ne=%lld, type=%s, %s)", s->name,
+                                 (long long) ggml_nelements(s), ggml_type_name(s->type),
+                                 stale == 2 ? "LEAF" : stale == 1 ? "VIEW(stale?)" : "INTERMEDIATE(stale-likely)");
+                        return std::string(b);
+                    };
+                    int st0 = -1, st1 = -1;
+                    const std::string si0 = src_info(dst->src[0], st0);
+                    const std::string si1 = src_info(dst->src[1], st1);
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        int lc = leaf_scan(dst->src[s]);
+                        if (lc > 0) {
+                            fprintf(stderr, "NANSCAN-LEAF src#%d name=%s type=%s ne=[%lld,%lld,%lld,%lld] LEAF-NAN cnt=%d/%lld\n",
+                                    s, dst->src[s]->name, ggml_type_name(dst->src[s]->type),
+                                    (long long) dst->src[s]->ne[0], (long long) dst->src[s]->ne[1],
+                                    (long long) dst->src[s]->ne[2], (long long) dst->src[s]->ne[3],
+                                    lc, (long long) ggml_nelements(dst->src[s]));
+                        }
+                    }
+                    fprintf(stderr, "NANSCAN first-nonfinite node#%d/%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] badcnt=%d firstbad=%lld src0=%s src1=%s uid=%zu n_nodes=%d\n",
                             i, cgraph->n_nodes, ggml_op_name(dst->op), dst->name,
                             (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
                             bad_cnt, (long long) bad_idx,
-                            dst->src[0] ? dst->src[0]->name : "-",
-                            dst->src[0] ? (long long) dst->src[0]->ne[0] : 0,
-                            dst->src[0] ? (long long) dst->src[0]->ne[1] : 0,
-                            dst->src[1] ? dst->src[1]->name : "-",
-                            dst->src[1] ? (long long) dst->src[1]->ne[0] : 0,
-                            dst->src[1] ? (long long) dst->src[1]->ne[1] : 0,
+                            si0.c_str(), si1.c_str(),
                             cgraph->uid, cgraph->n_nodes);
                     ++reported;
                 }
