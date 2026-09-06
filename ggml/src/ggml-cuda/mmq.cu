@@ -316,6 +316,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     //   근본 원인 규명 시 이 게이트를 되돌린다 (§124/§125 DEBT-ROCMFP4-MMQ-SMALLBATCH).
     // MoE(MUL_MAT_ID, n_experts>0)는 결함 미관측(decode/prefill 전 구간 factual 정상) — MMQ 유지.
     // 결함은 MUL_MAT의 ple_key/ple_value/hc_*/attn_qkv 타일에서만 재현됨 (§124/§125).
+    // [§138 최종] 256K H2 실험: coarse OFF + MMQ 복원 → fill 후 warm nan=True 재현 —
+    //   결함은 MMQ 커널 고유(부분 ubatch M∈[9,63] 타일 로딩), coarse-grain과 무관.
+    //   → rocmfp4 MUL_MAT는 MMQ 미사용 고정(MoE MUL_MAT_ID 제외). 근본 수정은 다음 세션.
     if ((type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) && n_experts == 0) {
         return false;
     }

@@ -149,8 +149,13 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         if (err == hipSuccess) {
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
             // ignore errors (e.g. hipErrorInvalidValue on some APU/iGPU configs).
-            (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
-            (void)hipGetLastError(); // clear any error
+            // [#27797] coarse-grain은 CPU<->GPU cache coherence를 비활성화해 qwen4exp의
+            // fine-grained history RW 경로에서 stale line 오염(//// collapse)을 일으킴 —
+            // GGML_CUDA_COARSE_GRAIN=1로 명시적으로만 활성(기본 OFF).
+            if (getenv("GGML_CUDA_COARSE_GRAIN") != nullptr) {
+                (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
+                (void)hipGetLastError(); // clear any error
+            }
         }
 
         // fall back to cudaMalloc if not supported (e.g. on Windows)
