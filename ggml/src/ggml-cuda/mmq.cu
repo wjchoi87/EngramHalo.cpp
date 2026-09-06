@@ -319,7 +319,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     // [§138 최종] 256K H2 실험: coarse OFF + MMQ 복원 → fill 후 warm nan=True 재현 —
     //   결함은 MMQ 커널 고유(부분 ubatch M∈[9,63] 타일 로딩), coarse-grain과 무관.
     //   → rocmfp4 MUL_MAT는 MMQ 미사용 고정(MoE MUL_MAT_ID 제외). 근본 수정은 다음 세션.
-    if ((type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) && n_experts == 0) {
+    // [§138] production: rocmfp4 MUL_MAT MMQ 비활성(결함). 디버그/재현은
+    //   GGML_CUDA_ROCMFP4_MMQ_FORCE=1(harness 전용)로만 우회.
+    static const bool rocmfp4_mmq_force = getenv("GGML_CUDA_ROCMFP4_MMQ_FORCE") != nullptr;
+    if ((type == GGML_TYPE_Q4_0_ROCMFP4 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST) && n_experts == 0 && !rocmfp4_mmq_force) {
         return false;
     }
 
