@@ -870,6 +870,46 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// [D1-FA] tile 비트맵 프리패스: (Q tile, KV tile) 쌍별 any-unmasked(마스크가 전부 -inf가 아닌지) 계산.
+// K tile 하나 = FATTN_KQ_STRIDE 개의 K 위치. 블록 = (k_tile, q_tile, seq) 하나.
+// 출력: KV_max 버퍼 뒤쪽에 배치되는 uint32 0/1 — 커널은 마스크 전체 읽기 대신 1회 읽기로 스킵 판단.
+template <int ncols1>
+static __global__ void flash_attn_mask_to_tile_bitmap(
+        const half2 * mask_ptr, int * out_ptr, const int64_t s31, const int64_t s33,
+        const int iter_k, const int ne01, const int ntiles_x) {
+    const int k_tile  = blockIdx.x;
+    const int q_tile  = blockIdx.y;
+    const int sequence= blockIdx.z;
+    const int tid     = threadIdx.x;   // FATTN_KQ_STRIDE/2 threads = FATTN_KQ_STRIDE half values
+
+    const half2 * mask = mask_ptr + sequence*s33;
+    int * out = out_ptr + (sequence*ntiles_x + q_tile)*iter_k + k_tile;
+
+    const int j0 = q_tile*ncols1;
+    const int j1 = min(ne01, j0 + ncols1);
+
+    const int k0 = k_tile*FATTN_KQ_STRIDE/2 + tid;   // half2 인덱스
+
+    int any_valid = 0;
+    for (int j = j0; j < j1; ++j) {
+        const float2 tmp = __half22float2(mask[j*s31 + k0]);
+        any_valid |= int(!isinf(tmp.x)) | int(!isinf(tmp.y));
+    }
+    any_valid = warp_reduce_any(any_valid);
+    __shared__ int buf_iw[WARP_SIZE];
+    if (tid % WARP_SIZE == 0) {
+        buf_iw[tid / WARP_SIZE] = any_valid;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int v = 0;
+        for (int w = 0; w < WARP_SIZE; ++w) {
+            v |= buf_iw[w];
+        }
+        *out = v;
+    }
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1243,7 +1283,10 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // [D1-FA] n_kv가 큰 경우(D1 버킷 고정 등) tile 비트맵 프리패스를 항상 실행 —
+    //     sparse 마스크(DSA top-k)에서 tile 전체 마스크 읽기 순회를 1회 비트 읽기로 대체.
+    const bool use_tile_bitmap = mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && K->ne[1] >= 16384;
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || use_tile_bitmap)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1253,11 +1296,27 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
-        CUDA_CHECK(cudaGetLastError());
+        // [D1-FA] 비트맵은 FA grid.z(head×seq 복합) 전체 인덱스를 수용해야 함
+        const int bitmap_z = use_tile_bitmap ? (int)((Q->ne[2]/ncols2) * Q->ne[3]) : 1;
+        KV_max.alloc(ne_KV_max + (use_tile_bitmap ? bitmap_z*ntiles_x*iter_k : 0) + 1);
+        if (use_tile_bitmap) {
+            // KV_max[0..ne_KV_max) = ne11 (커널의 k_VKQ_max 대체값), 그 뒤 = tile 비트맵
+            const int ne11_val = (int) K->ne[1];
+            {
+                std::vector<int> host_kv_max(ne_KV_max, ne11_val);
+                CUDA_CHECK(cudaMemcpyAsync(KV_max.ptr, host_kv_max.data(), ne_KV_max*sizeof(int), cudaMemcpyHostToDevice, main_stream));
+            }
+            ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+                dim3(iter_k, ntiles_x, Q->ne[3]), dim3(FATTN_KQ_STRIDE/2, 1, 1), 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_tile_bitmap<ncols1>, launch_params,
+                (const half2 *) mask->data, KV_max.ptr + ne_KV_max, s31, s33, iter_k, (int) Q->ne[1], ntiles_x);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);

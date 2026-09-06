@@ -588,7 +588,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         T_acc * const VKQ,
         const int k_VKQ_0,
         const int k_VKQ_max,
-        const int col_Q_0) {
+        const int col_Q_0,
+        const uint32_t * const __restrict__ tile_bitmap,
+        const int bitmap_k_tiles) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -616,10 +618,17 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     if (ncols2 > 1 || mask) {
         __shared__ int tile_any_unmasked;
         if (threadIdx.y == 0 && threadIdx.x == 0) {
-            tile_any_unmasked = 0;
+            // [D1-FA] 비트맵 모드: 프리패스가 계산한 tile 비트 1회 읽기로 스킵 판단 (마스크 전체 읽기 제거)
+            if (tile_bitmap != nullptr) {
+                const int k_tile = k_VKQ_0 / FATTN_KQ_STRIDE;
+                tile_any_unmasked = (int) tile_bitmap[blockIdx.x*bitmap_k_tiles + k_tile];
+            } else {
+                tile_any_unmasked = 0;
+            }
         }
         __syncthreads();
 
+        if (tile_bitmap == nullptr) {
         int any_unmasked = 0;
 #pragma unroll
         for (int j0 = 0; j0 < ncols1; ++j0) {
@@ -636,6 +645,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             tile_any_unmasked = 1;
         }
         __syncthreads();
+        }
         if (!tile_any_unmasked) {
             return;
         }
@@ -998,6 +1008,11 @@ static __global__ void flash_attn_tile(
 
     // Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // [D1-FA] 비트맵 모드: KV_max 버퍼 뒤쪽의 tile 비트맵 (ne11 >= 16384일 때 launch_fattn이 채움)
+    const int bitmap_k_tiles = ne11 / FATTN_KQ_STRIDE;
+    const uint32_t * tile_bitmap  = (KV_max != nullptr && ne11 >= 16384)
+        ? (const uint32_t *) (KV_max + gridDim.x * ne03 + (size_t) sequence * gridDim.x * bitmap_k_tiles)
+        : nullptr;
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
@@ -1005,14 +1020,16 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                tile_bitmap, bitmap_k_tiles);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                tile_bitmap, bitmap_k_tiles);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -1020,7 +1037,8 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                tile_bitmap, bitmap_k_tiles);
         }
     }
 
