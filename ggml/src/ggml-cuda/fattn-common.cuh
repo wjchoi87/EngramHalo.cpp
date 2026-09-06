@@ -1285,7 +1285,9 @@ void launch_fattn(
     //     multiple sequences of possibly different lengths.
     // [D1-FA] n_kv가 큰 경우(D1 버킷 고정 등) tile 비트맵 프리패스를 항상 실행 —
     //     sparse 마스크(DSA top-k)에서 tile 전체 마스크 읽기 순회를 1회 비트 읽기로 대체.
-    const bool use_tile_bitmap = mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && K->ne[1] >= 16384;
+    // [D1-FA] §136 실측: 비트맵 경로는 전 항목 역행(+48~60%) — 기본 OFF, env로만 활성
+    static const bool tile_bitmap_env = getenv("GGML_FA_TILE_BITMAP") != nullptr;
+    const bool use_tile_bitmap = tile_bitmap_env && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && K->ne[1] >= 16384;
     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || use_tile_bitmap)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
